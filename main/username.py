@@ -2258,6 +2258,326 @@ def classify_youtube_channel_response(username, response, profile_url):
 
 
 # ============================================================
+# SPECJALNA DETEKCJA PROFILI FACEBOOK
+# ============================================================
+
+def _facebook_profile_url_matches(value, username):
+    if not isinstance(value, str) or not value:
+        return False
+
+    parsed = urlparse(value)
+
+    if parsed.scheme not in ("http", "https"):
+        return False
+
+    if parsed.netloc.casefold() not in (
+        "facebook.com",
+        "www.facebook.com",
+        "m.facebook.com",
+    ):
+        return False
+
+    return (
+        unquote(parsed.path).strip("/").casefold()
+        == username.casefold()
+    )
+
+
+def _facebook_deep_link_profile_id(value):
+    if not isinstance(value, str):
+        return None
+
+    match = re.fullmatch(r"fb://profile/(\d+)", value.strip())
+
+    if not match:
+        return None
+
+    return match.group(1)
+
+
+def _facebook_normalized_title(value):
+    return " ".join(value.split()).casefold()
+
+
+def classify_facebook_profile_response(username, response, profile_url):
+    status_code = response.status_code
+    final_url = response.url or ""
+    parsed_final_url = urlparse(final_url)
+    final_path = unquote(parsed_final_url.path).casefold()
+
+    blocked_paths = (
+        "/login",
+        "/checkpoint",
+        "/challenge",
+        "/captcha",
+    )
+
+    if any(marker in final_path for marker in blocked_paths):
+        return (
+            BLOCKED,
+            None,
+            "Facebook login, checkpoint or challenge redirect"
+        )
+
+    if status_code == 429:
+        return (
+            RATE_LIMIT,
+            None,
+            "HTTP 429"
+        )
+
+    if status_code in (401, 403):
+        return (
+            BLOCKED,
+            None,
+            f"HTTP {status_code}"
+        )
+
+    if status_code >= 500:
+        return (
+            ERROR,
+            None,
+            f"HTTP {status_code}"
+        )
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = (
+        soup.title.get_text(" ", strip=True)
+        if soup.title
+        else ""
+    )
+
+    canonical_node = soup.find(
+        "link",
+        rel=lambda value: value and "canonical" in value,
+    )
+    canonical_url = (
+        canonical_node.get("href", "")
+        if canonical_node
+        else ""
+    )
+
+    def meta_content(property_name):
+        node = soup.find(
+            "meta",
+            attrs={"property": property_name},
+        )
+
+        return node.get("content", "") if node else ""
+
+    og_url = meta_content("og:url")
+    og_title = meta_content("og:title")
+    android_url = meta_content("al:android:url")
+    ios_url = meta_content("al:ios:url")
+
+    clear_login_titles = {
+        "log into facebook",
+        "log in to facebook",
+        "facebook – log in or sign up",
+        "facebook - log in or sign up",
+    }
+    normalized_title = _facebook_normalized_title(title)
+    login_form = soup.find(
+        "form",
+        action=lambda value: (
+            isinstance(value, str)
+            and "/login" in value.casefold()
+        ),
+    )
+
+    if normalized_title in clear_login_titles and login_form:
+        return (
+            BLOCKED,
+            None,
+            "Facebook login wall"
+        )
+
+    route_names = set(re.findall(
+        r'"canonicalRouteName":"([^"]+)"',
+        response.text,
+    ))
+    error_route = (
+        any("CometErrorRoute" in route for route in route_names)
+        or (
+            '"privacy":true' in response.text
+            and '"tracePolicy":"comet.error"' in response.text
+        )
+    )
+
+    if error_route:
+        return (
+            UNKNOWN,
+            None,
+            "Facebook error/privacy route; account existence unknown"
+        )
+
+    expected_username = username.casefold()
+    user_vanities = {
+        unquote(value).casefold()
+        for value in re.findall(
+            r'"userVanity":"([^"]+)"',
+            response.text,
+        )
+    }
+    route_vanities = {
+        unquote(value).casefold()
+        for value in re.findall(
+            r'"vanity":"([^"]+)"',
+            response.text,
+        )
+    }
+    route_profile_paths = {
+        unquote(value.replace("\\/", "/")).strip("/").casefold()
+        for value in re.findall(
+            r'"url":"((?:\\/|/)[^"?#]+)"',
+            response.text,
+        )
+    }
+    route_user_ids = set(re.findall(
+        r'"userID":"(\d+)"',
+        response.text,
+    ))
+
+    final_url_matches = _facebook_profile_url_matches(
+        final_url,
+        username,
+    )
+    canonical_matches = _facebook_profile_url_matches(
+        canonical_url,
+        username,
+    )
+    og_url_matches = _facebook_profile_url_matches(
+        og_url,
+        username,
+    )
+
+    final_path_parts = [
+        part
+        for part in unquote(parsed_final_url.path).split("/")
+        if part
+    ]
+    final_url_conflict = (
+        len(final_path_parts) == 1
+        and final_path_parts[0].casefold() != expected_username
+    )
+    canonical_conflict = bool(
+        canonical_url
+        and not canonical_matches
+    )
+    og_url_conflict = bool(
+        og_url
+        and not og_url_matches
+    )
+    vanity_conflict = bool(
+        (user_vanities and user_vanities != {expected_username})
+        or (route_vanities and route_vanities != {expected_username})
+    )
+    route_path_conflict = bool(
+        route_profile_paths
+        and expected_username not in route_profile_paths
+    )
+
+    android_profile_id = _facebook_deep_link_profile_id(android_url)
+    ios_profile_id = _facebook_deep_link_profile_id(ios_url)
+    deep_link_ids = {
+        profile_id
+        for profile_id in (android_profile_id, ios_profile_id)
+        if profile_id
+    }
+    profile_id_conflict = (
+        bool(android_url and ios_url)
+        and (
+            not android_profile_id
+            or not ios_profile_id
+            or android_profile_id != ios_profile_id
+        )
+    ) or (
+        bool(route_user_ids and deep_link_ids)
+        and route_user_ids != deep_link_ids
+    ) or len(route_user_ids) > 1
+
+    title_conflict = bool(
+        title
+        and og_title
+        and _facebook_normalized_title(title)
+        != _facebook_normalized_title(og_title)
+    )
+
+    if (
+        final_url_conflict
+        or canonical_conflict
+        or og_url_conflict
+        or vanity_conflict
+        or route_path_conflict
+        or profile_id_conflict
+        or title_conflict
+    ):
+        return (
+            UNKNOWN,
+            None,
+            "Facebook profile evidence conflict"
+        )
+
+    if status_code >= 400:
+        return (
+            UNKNOWN,
+            None,
+            f"unconfirmed Facebook HTTP {status_code}; "
+            "account existence unknown"
+        )
+
+    if status_code != 200 or not final_url_matches:
+        return (
+            UNKNOWN,
+            None,
+            "unexpected Facebook final URL; account existence unknown"
+        )
+
+    titles_match = bool(
+        title
+        and og_title
+        and normalized_title != "facebook"
+        and normalized_title
+        == _facebook_normalized_title(og_title)
+    )
+    route_username_matches = (
+        user_vanities == {expected_username}
+        and route_vanities == {expected_username}
+        and expected_username in route_profile_paths
+    )
+    profile_id_matches = (
+        bool(android_profile_id)
+        and bool(ios_profile_id)
+        and len(deep_link_ids) == 1
+        and deep_link_ids == route_user_ids
+    )
+    profile_root_matches = (
+        "comet.fbweb.CometProfilePlusLoggedOutRoute" in route_names
+        and "ProfilePlusCometLoggedOutRoot.react" in response.text
+    )
+
+    if (
+        canonical_matches
+        and og_url_matches
+        and titles_match
+        and route_username_matches
+        and profile_id_matches
+        and profile_root_matches
+    ):
+        return (
+            FOUND,
+            profile_url,
+            "public Facebook profile found; identity not verified"
+        )
+
+    return (
+        POSSIBLE,
+        profile_url,
+        "incomplete Facebook public profile evidence"
+    )
+
+
+# ============================================================
 # SPRAWDZANIE JEDNEGO SERWISU
 # ============================================================
 
@@ -2415,6 +2735,20 @@ def check_username_on_site(username, site_name, site_config):
 
         if checker == "youtube_channel":
             status, link, info = classify_youtube_channel_response(
+                username,
+                response,
+                url,
+            )
+
+            return (
+                site_name,
+                status,
+                link,
+                info,
+            )
+
+        if checker == "facebook_profile":
+            status, link, info = classify_facebook_profile_response(
                 username,
                 response,
                 url,

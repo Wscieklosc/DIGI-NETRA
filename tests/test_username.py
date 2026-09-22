@@ -1691,5 +1691,276 @@ class RedditDetectionRegressionTests(unittest.TestCase):
         self.assertEqual(result[1], BLOCKED)
 
 
+class FacebookProfileDetectionTests(unittest.TestCase):
+    def setUp(self):
+        self.site_name = "Facebook"
+        self.username = "TestUser"
+        self.profile_id = "123456789"
+        self.site_config = {
+            "url": "https://www.facebook.com/{username}",
+            "checker": "facebook_profile",
+            "needs_login": True,
+            "rate_limit_delay": 0,
+        }
+
+    def response(self, status_code, text="", url=None):
+        response = Mock()
+        response.status_code = status_code
+        response.text = text
+        response.url = (
+            url
+            or f"https://www.facebook.com/{self.username}"
+        )
+        return response
+
+    def check(self, response=None, side_effect=None):
+        with (
+            patch(
+                "main.username.requests.request",
+                return_value=response,
+                side_effect=side_effect,
+            ),
+            patch("main.username.time.sleep"),
+        ):
+            return check_username_on_site(
+                self.username,
+                self.site_name,
+                self.site_config,
+            )
+
+    def profile_html(
+        self,
+        *,
+        canonical_username=None,
+        og_username=None,
+        route_username=None,
+        deep_link_profile_id=None,
+        route_profile_id=None,
+        include_canonical=True,
+        include_profile_id=True,
+        include_profile_root=True,
+    ):
+        canonical_username = canonical_username or self.username
+        og_username = og_username or self.username
+        route_username = route_username or self.username
+        deep_link_profile_id = (
+            deep_link_profile_id or self.profile_id
+        )
+        route_profile_id = route_profile_id or self.profile_id
+        title = "Test User"
+
+        canonical = ""
+
+        if include_canonical:
+            canonical = (
+                '<link rel="canonical" '
+                f'href="https://www.facebook.com/{canonical_username}/">'
+            )
+
+        deep_links = ""
+        route_id = ""
+
+        if include_profile_id:
+            deep_links = f"""
+                <meta property="al:android:url"
+                    content="fb://profile/{deep_link_profile_id}">
+                <meta property="al:ios:url"
+                    content="fb://profile/{deep_link_profile_id}">
+            """
+            route_id = f'"userID":"{route_profile_id}",'
+
+        profile_root = (
+            '"resource":{"__dr":'
+            '"ProfilePlusCometLoggedOutRoot.react"},'
+            if include_profile_root
+            else ""
+        )
+        route_name = (
+            '"canonicalRouteName":'
+            '"comet.fbweb.CometProfilePlusLoggedOutRoute"'
+            if include_profile_root
+            else '"canonicalRouteName":"unrecognized.route"'
+        )
+        route_data = (
+            "{"
+            f"{profile_root}"
+            f'"props":{{{route_id}'
+            f'"userVanity":"{route_username}"}},'
+            f'"url":"/{route_username}",'
+            f'"params":{{"vanity":"{route_username}"}},'
+            f"{route_name}"
+            "}"
+        )
+
+        return f"""
+            <html>
+                <head>
+                    <title>{title}</title>
+                    {canonical}
+                    <meta property="og:url"
+                        content="https://www.facebook.com/{og_username}/">
+                    <meta property="og:title" content="{title}">
+                    {deep_links}
+                </head>
+                <body><script>{route_data}</script></body>
+            </html>
+        """
+
+    def test_facebook_complete_public_profile_is_found(self):
+        result = self.check(
+            self.response(200, text=self.profile_html())
+        )
+
+        self.assertEqual(result[1], FOUND)
+        self.assertEqual(
+            result[3],
+            "public Facebook profile found; identity not verified",
+        )
+
+    def test_facebook_missing_canonical_does_not_return_found(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.profile_html(include_canonical=False),
+            )
+        )
+
+        self.assertEqual(result[1], POSSIBLE)
+
+    def test_facebook_wrong_canonical_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.profile_html(
+                    canonical_username="AnotherUser",
+                ),
+            )
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_facebook_wrong_og_url_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.profile_html(og_username="AnotherUser"),
+            )
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_facebook_vanity_conflict_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.profile_html(route_username="AnotherUser"),
+            )
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_facebook_profile_id_conflict_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.profile_html(route_profile_id="987654321"),
+            )
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_facebook_missing_profile_id_does_not_return_found(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.profile_html(include_profile_id=False),
+            )
+        )
+
+        self.assertEqual(result[1], POSSIBLE)
+
+    def test_facebook_missing_one_deep_link_does_not_return_found(self):
+        html = self.profile_html().replace(
+            '<meta property="al:ios:url"',
+            '<meta property="removed:ios:url"',
+        )
+        result = self.check(self.response(200, text=html))
+
+        self.assertEqual(result[1], POSSIBLE)
+
+    def test_facebook_comet_error_route_is_unknown(self):
+        html = """
+            <html>
+                <head><title>Facebook</title></head>
+                <body><script>
+                    {"privacy":true,"tracePolicy":"comet.error",
+                    "canonicalRouteName":"comet.fbweb.CometErrorRoute"}
+                </script></body>
+            </html>
+        """
+        result = self.check(self.response(200, text=html))
+
+        self.assertEqual(result[1], UNKNOWN)
+        self.assertIn("account existence unknown", result[3])
+
+    def test_facebook_login_redirect_is_blocked(self):
+        result = self.check(
+            self.response(
+                200,
+                text="<html><title>Log into Facebook</title></html>",
+                url=(
+                    "https://www.facebook.com/login/"
+                    "?next=%2FTestUser"
+                ),
+            )
+        )
+
+        self.assertEqual(result[1], BLOCKED)
+
+    def test_facebook_bundle_words_alone_do_not_mean_blocked(self):
+        html = """
+            <html><head><title>Test User</title></head>
+            <body>login checkpoint captcha challenge</body></html>
+        """
+        result = self.check(self.response(200, text=html))
+
+        self.assertEqual(result[1], POSSIBLE)
+
+    def test_facebook_404_is_unknown_not_not_found(self):
+        result = self.check(
+            self.response(
+                404,
+                text="<html><title>Facebook</title></html>",
+            )
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_facebook_429_is_rate_limited(self):
+        result = self.check(self.response(429))
+
+        self.assertEqual(result[1], RATE_LIMIT)
+
+    def test_facebook_5xx_is_error(self):
+        result = self.check(self.response(503))
+
+        self.assertEqual(result[1], ERROR)
+
+    def test_facebook_timeout_is_error(self):
+        result = self.check(side_effect=requests.Timeout())
+
+        self.assertEqual(result[1], ERROR)
+
+    def test_facebook_network_failure_is_error(self):
+        result = self.check(side_effect=requests.ConnectionError())
+
+        self.assertEqual(result[1], ERROR)
+
+    def test_facebook_config_uses_dedicated_checker(self):
+        config = load_sites_config()["Facebook"]
+
+        self.assertEqual(config["checker"], "facebook_profile")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -16,8 +16,9 @@
     "redirect_behavior": "follow",
     "confidence_score": 0.95
   },
-    "Facebook": {
+  "Facebook": {
     "url": "https://www.facebook.com/{username}",
+    "checker": "facebook_profile",
     "detect_based_on_message": false,
     "not_found_status_codes": [404],
     "not_found_message": "This content isn't available at the moment",
