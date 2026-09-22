@@ -684,6 +684,251 @@ class XNXXProfileDetectionTests(unittest.TestCase):
         self.assertEqual(result[1], RATE_LIMIT)
 
 
+class BookSusiProfileDetectionTests(unittest.TestCase):
+    def setUp(self):
+        self.site_name = "BookSusi"
+        self.site_config = {
+            "url": "https://booksusi.com/user/{username}/",
+            "checker": "booksusi_profile",
+            "category": "adult",
+            "sensitive": True,
+            "rate_limit_delay": 0,
+        }
+
+    def response(self, status_code, text="", url=None):
+        response = Mock()
+        response.status_code = status_code
+        response.text = text
+        response.url = (
+            url
+            or "https://booksusi.com/user/test_user/"
+        )
+        return response
+
+    def check(self, response, username="test_user"):
+        with (
+            patch(
+                "main.username.requests.request",
+                return_value=response,
+            ),
+            patch("main.username.time.sleep"),
+        ):
+            return check_username_on_site(
+                username,
+                self.site_name,
+                self.site_config,
+            )
+
+    def profile_html(
+        self,
+        canonical_url=(
+            "https://booksusi.com/user/test_user/"
+        ),
+        entity_url="https://booksusi.com/user/test_user/",
+        include_profile_page=True,
+        include_person=True,
+    ):
+        scripts = [
+            {
+                "@context": "https://schema.org",
+                "@type": "Organization",
+                "name": "BookSusi",
+                "url": "https://booksusi.com/",
+            },
+            {
+                "@context": "https://schema.org",
+                "@type": "WebSite",
+                "name": "BookSusi",
+                "url": "https://booksusi.com/",
+            },
+        ]
+
+        if include_profile_page:
+            main_entity = {
+                "name": "Test Display",
+                "url": entity_url,
+            }
+
+            if include_person:
+                main_entity["@type"] = "Person"
+
+            scripts.insert(
+                0,
+                {
+                    "@context": "https://schema.org",
+                    "@type": "ProfilePage",
+                    "mainEntity": main_entity,
+                },
+            )
+
+        canonical_html = (
+            f'<link rel="canonical" href="{canonical_url}">'
+            if canonical_url is not None
+            else ""
+        )
+        scripts_html = "".join(
+            '<script type="application/ld+json">'
+            f"{json.dumps(payload)}"
+            "</script>"
+            for payload in scripts
+        )
+
+        return f"""
+            <html>
+                <head>
+                    <title>
+                        ANBIETER: Test Display - Wien - BookSusi
+                    </title>
+                    {canonical_html}
+                    {scripts_html}
+                </head>
+                <body>
+                    <a href="/login/">Login</a>
+                    <a href="/register/">Register</a>
+                    <h1 class="profile-name d-block d-sm-none">
+                        Test Display
+                    </h1>
+                    <div id="profile-new" class="profile">
+                        <div class="profile__identity">
+                            Test Display seit 2020
+                        </div>
+                    </div>
+                </body>
+            </html>
+        """
+
+    def test_booksusi_complete_public_profile_is_found(self):
+        result = self.check(
+            self.response(200, text=self.profile_html())
+        )
+
+        self.assertEqual(result[1], FOUND)
+        self.assertEqual(
+            result[3],
+            "public BookSusi profile found; identity not verified",
+        )
+
+    def test_booksusi_missing_canonical_does_not_return_found(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.profile_html(canonical_url=None),
+            )
+        )
+
+        self.assertEqual(result[1], POSSIBLE)
+        self.assertNotEqual(result[1], FOUND)
+
+    def test_booksusi_wrong_canonical_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.profile_html(
+                    canonical_url=(
+                        "https://booksusi.com/user/other_user/"
+                    ),
+                ),
+            )
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_booksusi_wrong_main_entity_url_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.profile_html(
+                    entity_url=(
+                        "https://booksusi.com/user/other_user/"
+                    ),
+                ),
+            )
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_booksusi_missing_profile_page_does_not_return_found(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.profile_html(include_profile_page=False),
+            )
+        )
+
+        self.assertEqual(result[1], POSSIBLE)
+        self.assertNotEqual(result[1], FOUND)
+
+    def test_booksusi_missing_person_does_not_return_found(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.profile_html(include_person=False),
+            )
+        )
+
+        self.assertEqual(result[1], POSSIBLE)
+        self.assertNotEqual(result[1], FOUND)
+
+    def test_booksusi_confirmed_missing_profile_is_not_found(self):
+        scripts = [
+            {
+                "@context": "https://schema.org",
+                "@type": "Organization",
+                "name": "BookSusi",
+            },
+            {
+                "@context": "https://schema.org",
+                "@type": "WebSite",
+                "name": "BookSusi",
+            },
+        ]
+        scripts_html = "".join(
+            '<script type="application/ld+json">'
+            f"{json.dumps(payload)}"
+            "</script>"
+            for payload in scripts
+        )
+        html = f"""
+            <html>
+                <head><title>BookSusi</title>{scripts_html}</head>
+                <body>
+                    <h1>Susi</h1>
+                    <h1>404!</h1>
+                    <p>
+                        Die Seite die Sie versucht haben zu öffnen gibt es
+                        leider nicht auf unserem Server! Sorry....
+                    </p>
+                </body>
+            </html>
+        """
+        result = self.check(self.response(404, text=html))
+
+        self.assertEqual(result[1], NOT_FOUND)
+        self.assertIn("no public BookSusi profile", result[3])
+
+    def test_booksusi_403_is_blocked(self):
+        result = self.check(self.response(403))
+
+        self.assertEqual(result[1], BLOCKED)
+
+    def test_booksusi_429_is_rate_limited(self):
+        result = self.check(self.response(429))
+
+        self.assertEqual(result[1], RATE_LIMIT)
+
+    def test_booksusi_username_comparison_uses_casefold(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.profile_html(),
+                url="https://booksusi.com/user/Test_User/",
+            ),
+            username="Test_User",
+        )
+
+        self.assertEqual(result[1], FOUND)
+
+
 class FanslyProfileDetectionTests(unittest.TestCase):
     def setUp(self):
         self.site_name = "Fansly"

@@ -909,6 +909,308 @@ def classify_xnxx_profile_response(username, response, profile_url):
 
 
 # ============================================================
+# SPECJALNA DETEKCJA PUBLICZNYCH PROFILI BOOKSUSI
+# ============================================================
+
+def _booksusi_profile_url_matches(value, username):
+    if not isinstance(value, str) or not value:
+        return False
+
+    parsed = urlparse(value)
+
+    return (
+        parsed.scheme == "https"
+        and parsed.netloc.casefold() == "booksusi.com"
+        and unquote(parsed.path).casefold()
+        == f"/user/{username}/".casefold()
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
+def _booksusi_json_ld_data(soup):
+    profile_pages = []
+    people = []
+    invalid_json = False
+
+    for node in soup.find_all(
+        "script",
+        attrs={"type": "application/ld+json"},
+    ):
+        try:
+            payload = json.loads(node.string or node.get_text())
+        except (TypeError, ValueError):
+            invalid_json = True
+            continue
+
+        values = payload if isinstance(payload, list) else [payload]
+
+        for value in values:
+            if not isinstance(value, dict):
+                continue
+
+            candidates = [value]
+            graph = value.get("@graph")
+
+            if isinstance(graph, list):
+                candidates.extend(graph)
+
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    continue
+
+                if candidate.get("@type") == "ProfilePage":
+                    profile_pages.append(candidate)
+
+                if candidate.get("@type") == "Person":
+                    people.append(candidate)
+
+                main_entity = candidate.get("mainEntity")
+
+                if (
+                    isinstance(main_entity, dict)
+                    and main_entity.get("@type") == "Person"
+                ):
+                    people.append(main_entity)
+
+    return profile_pages, people, invalid_json
+
+
+def classify_booksusi_profile_response(username, response, profile_url):
+    status_code = response.status_code
+
+    if status_code == 429:
+        return (
+            RATE_LIMIT,
+            None,
+            "HTTP 429"
+        )
+
+    if status_code in (401, 403):
+        return (
+            BLOCKED,
+            None,
+            f"HTTP {status_code}"
+        )
+
+    if status_code >= 500:
+        return (
+            ERROR,
+            None,
+            f"HTTP {status_code}"
+        )
+
+    final_url_lower = response.url.casefold()
+    block_url_markers = (
+        "/login",
+        "/signin",
+        "/challenge",
+        "/captcha",
+    )
+
+    if any(
+        marker in final_url_lower
+        for marker in block_url_markers
+    ):
+        return (
+            BLOCKED,
+            None,
+            "BookSusi login or challenge redirect"
+        )
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = (
+        " ".join(soup.title.get_text(" ", strip=True).split())
+        if soup.title
+        else ""
+    )
+    title_lower = title.casefold()
+    blocked_title_markers = (
+        "access denied",
+        "captcha",
+        "challenge",
+        "just a moment",
+    )
+
+    if any(
+        marker in title_lower
+        for marker in blocked_title_markers
+    ):
+        return (
+            BLOCKED,
+            None,
+            "BookSusi access challenge"
+        )
+
+    final_url_matches = _booksusi_profile_url_matches(
+        response.url,
+        username,
+    )
+    canonical = soup.find(
+        "link",
+        rel=lambda value: value and "canonical" in value,
+    )
+    canonical_url = canonical.get("href", "") if canonical else ""
+    canonical_matches = _booksusi_profile_url_matches(
+        canonical_url,
+        username,
+    )
+    profile_pages, people, invalid_json = _booksusi_json_ld_data(
+        soup
+    )
+    profile_container = soup.select_one("#profile-new.profile")
+
+    not_found_heading = any(
+        " ".join(node.get_text(" ", strip=True).split()) == "404!"
+        for node in soup.find_all("h1")
+    )
+    not_found_message = (
+        "die seite die sie versucht haben zu öffnen gibt es leider "
+        "nicht auf unserem server!"
+    )
+    normalized_page_text = " ".join(
+        soup.get_text(" ", strip=True).split()
+    ).casefold()
+
+    if status_code == 404:
+        if (
+            final_url_matches
+            and not_found_heading
+            and not_found_message in normalized_page_text
+            and canonical is None
+            and not profile_pages
+            and not people
+            and not invalid_json
+            and profile_container is None
+        ):
+            return (
+                NOT_FOUND,
+                None,
+                "no public BookSusi profile at this path"
+            )
+
+        return (
+            UNKNOWN,
+            None,
+            "unconfirmed BookSusi 404 response"
+        )
+
+    if status_code >= 400:
+        return (
+            UNKNOWN,
+            None,
+            f"HTTP {status_code}"
+        )
+
+    if status_code != 200 or not final_url_matches:
+        return (
+            UNKNOWN,
+            None,
+            "unexpected BookSusi final URL"
+        )
+
+    if canonical_url and not canonical_matches:
+        return (
+            UNKNOWN,
+            None,
+            "BookSusi canonical conflicts with the username"
+        )
+
+    if invalid_json:
+        return (
+            UNKNOWN,
+            None,
+            "invalid BookSusi JSON-LD data"
+        )
+
+    if len(profile_pages) > 1:
+        return (
+            UNKNOWN,
+            None,
+            "multiple BookSusi ProfilePage records"
+        )
+
+    profile_page = profile_pages[0] if profile_pages else None
+    main_entity = (
+        profile_page.get("mainEntity")
+        if isinstance(profile_page, dict)
+        else None
+    )
+
+    if main_entity is not None and not isinstance(main_entity, dict):
+        return (
+            UNKNOWN,
+            None,
+            "invalid BookSusi mainEntity data"
+        )
+
+    if isinstance(main_entity, dict):
+        entity_type = main_entity.get("@type")
+        entity_name = main_entity.get("name")
+        entity_url = main_entity.get("url")
+
+        if entity_type is not None and entity_type != "Person":
+            return (
+                UNKNOWN,
+                None,
+                "BookSusi mainEntity is not a Person"
+            )
+
+        if entity_name is not None and not isinstance(
+            entity_name,
+            str,
+        ):
+            return (
+                UNKNOWN,
+                None,
+                "invalid BookSusi profile name"
+            )
+
+        if entity_url and not _booksusi_profile_url_matches(
+            entity_url,
+            username,
+        ):
+            return (
+                UNKNOWN,
+                None,
+                "BookSusi mainEntity URL conflicts with the username"
+            )
+
+    title_matches = bool(
+        re.search(r"(?:^|\s)booksusi$", title, re.IGNORECASE)
+    )
+    complete_main_entity = (
+        isinstance(main_entity, dict)
+        and main_entity.get("@type") == "Person"
+        and isinstance(main_entity.get("name"), str)
+        and bool(main_entity.get("name", "").strip())
+        and _booksusi_profile_url_matches(
+            main_entity.get("url"),
+            username,
+        )
+    )
+
+    if (
+        canonical_matches
+        and profile_container is not None
+        and len(profile_pages) == 1
+        and complete_main_entity
+        and title_matches
+    ):
+        return (
+            FOUND,
+            profile_url,
+            "public BookSusi profile found; identity not verified"
+        )
+
+    return (
+        POSSIBLE,
+        profile_url,
+        "incomplete BookSusi profile evidence"
+    )
+
+
+# ============================================================
 # SPECJALNA DETEKCJA PUBLICZNYCH PROFILI FANSLY
 # ============================================================
 
@@ -1665,6 +1967,20 @@ def check_username_on_site(username, site_name, site_config):
 
         if checker == "xnxx_profile":
             status, link, info = classify_xnxx_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return (
+                site_name,
+                status,
+                link,
+                info,
+            )
+
+        if checker == "booksusi_profile":
+            status, link, info = classify_booksusi_profile_response(
                 username,
                 response,
                 url,
