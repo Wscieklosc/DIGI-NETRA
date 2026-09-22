@@ -73,7 +73,7 @@
     "detect_based_on_message": true,
     "not_found_status_codes": [],
     "not_found_message": "This user does not exist",
-    "found_message": "Trophy Case",
+    "found_message": "",
     "request_method": "GET",
     "headers": {
       "User-Agent": "Mozilla/5.0"
@@ -260,9 +260,9 @@
   },
   "YouTube": {
     "url": "https://www.youtube.com/@{username}",
+    "checker": "youtube_channel",
     "detect_based_on_message": false,
     "not_found_status_codes": [404],
-    "found_status_codes": [200],
     "not_found_message": "This channel does not exist",
     "found_message": "",
     "request_method": "GET",

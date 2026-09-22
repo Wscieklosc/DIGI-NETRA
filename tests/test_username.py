@@ -13,6 +13,7 @@ from main.username import (
     RATE_LIMIT,
     UNKNOWN,
     check_username_on_site,
+    load_sites_config,
 )
 
 
@@ -1386,6 +1387,308 @@ class TinderProfileDetectionTests(unittest.TestCase):
         result = self.check(self.response(429))
 
         self.assertEqual(result[1], RATE_LIMIT)
+
+
+class YouTubeChannelDetectionTests(unittest.TestCase):
+    def setUp(self):
+        self.site_name = "YouTube"
+        self.site_config = {
+            "url": "https://www.youtube.com/@{username}",
+            "checker": "youtube_channel",
+            "cookies": {"SOCS": "CAI"},
+            "rate_limit_delay": 0,
+        }
+        self.username = "TestChannel"
+        self.channel_id = "UCTestChannel1234567890ab"
+
+    def response(self, status_code, text="", url=None):
+        response = Mock()
+        response.status_code = status_code
+        response.text = text
+        response.url = (
+            url
+            or f"https://www.youtube.com/@{self.username}"
+        )
+        return response
+
+    def check(
+        self,
+        response=None,
+        username=None,
+        side_effect=None,
+    ):
+        checked_username = username or self.username
+
+        with (
+            patch(
+                "main.username.requests.request",
+                return_value=response,
+                side_effect=side_effect,
+            ),
+            patch("main.username.time.sleep"),
+        ):
+            return check_username_on_site(
+                checked_username,
+                self.site_name,
+                self.site_config,
+            )
+
+    def channel_html(
+        self,
+        *,
+        username=None,
+        html_channel_id=None,
+        json_channel_id=None,
+        include_initial_data=True,
+        include_microformat=True,
+    ):
+        username = username or self.username
+        html_channel_id = html_channel_id or self.channel_id
+        json_channel_id = json_channel_id or html_channel_id
+        handle_url = f"https://www.youtube.com/@{username}"
+        channel_url = (
+            f"https://www.youtube.com/channel/{html_channel_id}"
+        )
+        json_channel_url = (
+            f"https://www.youtube.com/channel/{json_channel_id}"
+        )
+
+        initial_data_script = ""
+
+        if include_initial_data:
+            microformat = {}
+
+            if include_microformat:
+                microformat = {
+                    "microformat": {
+                        "microformatDataRenderer": {
+                            "urlCanonical": json_channel_url,
+                            "channelProfileMicroformatDetails": {
+                                "profilePage": {
+                                    "url": json_channel_url,
+                                    "mainEntity": {
+                                        "url": json_channel_url,
+                                        "alternateName": f"@{username}",
+                                    },
+                                },
+                            },
+                        },
+                    },
+                }
+
+            initial_data = {
+                "metadata": {
+                    "channelMetadataRenderer": {
+                        "externalId": json_channel_id,
+                        "channelUrl": json_channel_url,
+                        "ownerUrls": [handle_url],
+                        "vanityChannelUrl": handle_url,
+                    },
+                },
+                **microformat,
+            }
+            initial_data_script = (
+                "<script>var ytInitialData = "
+                f"{json.dumps(initial_data)};"
+                "</script>"
+            )
+
+        return f"""
+            <html>
+                <head>
+                    <title>{username} - YouTube</title>
+                    <link rel="canonical" href="{channel_url}">
+                    <meta property="og:url" content="{channel_url}">
+                    <meta property="og:type" content="profile">
+                    <meta itemprop="identifier" content="{html_channel_id}">
+                </head>
+                <body>{initial_data_script}</body>
+            </html>
+        """
+
+    def test_youtube_complete_multisignal_profile_is_found(self):
+        result = self.check(
+            self.response(200, text=self.channel_html())
+        )
+
+        self.assertEqual(result[1], FOUND)
+        self.assertEqual(
+            result[3],
+            "public YouTube channel found; identity not verified",
+        )
+
+    def test_youtube_unicode_handle_uses_url_decode_and_casefold(self):
+        username = "日本テレビ"
+        encoded_url = (
+            "https://www.youtube.com/"
+            "@%E6%97%A5%E6%9C%AC%E3%83%86%E3%83%AC%E3%83%93"
+        )
+        result = self.check(
+            self.response(
+                200,
+                text=self.channel_html(username=username),
+                url=encoded_url,
+            ),
+            username=username,
+        )
+
+        self.assertEqual(result[1], FOUND)
+
+    def test_youtube_incomplete_200_is_possible(self):
+        result = self.check(
+            self.response(
+                200,
+                text="<html><title>TestChannel - YouTube</title></html>",
+            )
+        )
+
+        self.assertEqual(result[1], POSSIBLE)
+
+    def test_youtube_missing_microformat_handle_is_possible(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.channel_html(include_microformat=False),
+            )
+        )
+
+        self.assertEqual(result[1], POSSIBLE)
+
+    def test_youtube_conflicting_handle_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.channel_html(username="AnotherChannel"),
+            )
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_youtube_conflicting_channel_id_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.channel_html(
+                    json_channel_id="UCAnotherChannel123456789",
+                ),
+            )
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_youtube_wrong_final_handle_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.channel_html(),
+                url="https://www.youtube.com/@AnotherChannel",
+            )
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_youtube_confirmed_404_is_not_found(self):
+        result = self.check(
+            self.response(
+                404,
+                text="<html><title>404 Not Found</title></html>",
+            )
+        )
+
+        self.assertEqual(result[1], NOT_FOUND)
+
+    def test_youtube_404_with_profile_data_is_unknown(self):
+        result = self.check(
+            self.response(
+                404,
+                text=self.channel_html(),
+            )
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_youtube_consent_redirect_is_blocked(self):
+        result = self.check(
+            self.response(
+                200,
+                text="<html><title>Before you continue</title></html>",
+                url="https://consent.youtube.com/m?continue=profile",
+            )
+        )
+
+        self.assertEqual(result[1], BLOCKED)
+
+    def test_youtube_403_is_blocked(self):
+        result = self.check(self.response(403))
+
+        self.assertEqual(result[1], BLOCKED)
+
+    def test_youtube_429_is_rate_limited(self):
+        result = self.check(self.response(429))
+
+        self.assertEqual(result[1], RATE_LIMIT)
+
+    def test_youtube_5xx_is_error(self):
+        result = self.check(self.response(503))
+
+        self.assertEqual(result[1], ERROR)
+
+    def test_youtube_timeout_is_error(self):
+        result = self.check(side_effect=requests.Timeout())
+
+        self.assertEqual(result[1], ERROR)
+
+    def test_youtube_network_failure_is_error(self):
+        result = self.check(side_effect=requests.ConnectionError())
+
+        self.assertEqual(result[1], ERROR)
+
+    def test_youtube_config_has_checker_without_found_status_200(self):
+        config = load_sites_config()["YouTube"]
+
+        self.assertEqual(config["checker"], "youtube_channel")
+        self.assertNotIn("found_status_codes", config)
+        self.assertEqual(config["cookies"], {"SOCS": "CAI"})
+
+
+class RedditDetectionRegressionTests(unittest.TestCase):
+    def check(self, response):
+        config = {
+            **load_sites_config()["Reddit"],
+            "rate_limit_delay": 0,
+        }
+
+        with (
+            patch(
+                "main.username.requests.request",
+                return_value=response,
+            ),
+            patch("main.username.time.sleep"),
+        ):
+            return check_username_on_site(
+                "test_user",
+                "Reddit",
+                config,
+            )
+
+    def response(self, status_code, text=""):
+        response = Mock()
+        response.status_code = status_code
+        response.text = text
+        response.url = "https://www.reddit.com/user/test_user"
+        return response
+
+    def test_reddit_trophy_case_alone_is_not_found_evidence(self):
+        result = self.check(
+            self.response(200, "<html>Trophy Case</html>")
+        )
+
+        self.assertEqual(result[1], POSSIBLE)
+
+    def test_reddit_403_remains_blocked(self):
+        result = self.check(self.response(403, "Trophy Case"))
+
+        self.assertEqual(result[1], BLOCKED)
 
 
 if __name__ == "__main__":

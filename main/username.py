@@ -1879,6 +1879,385 @@ def classify_tinder_profile_response(username, response, profile_url):
 
 
 # ============================================================
+# SPECJALNA DETEKCJA KANALOW YOUTUBE
+# ============================================================
+
+def _youtube_handle_from_value(value):
+    if not isinstance(value, str) or not value:
+        return None
+
+    decoded_value = unquote(value).strip()
+
+    if decoded_value.startswith("@") and "/" not in decoded_value:
+        return decoded_value[1:].casefold()
+
+    parsed = urlparse(decoded_value)
+
+    if parsed.netloc.lower() not in (
+        "youtube.com",
+        "www.youtube.com",
+        "m.youtube.com",
+    ):
+        return None
+
+    path = unquote(parsed.path).strip("/")
+
+    if path.startswith("@") and "/" not in path:
+        return path[1:].casefold()
+
+    return None
+
+
+def _youtube_handle_url_matches(value, username):
+    return _youtube_handle_from_value(value) == username.casefold()
+
+
+def _youtube_channel_id_from_value(value):
+    if not isinstance(value, str) or not value:
+        return None
+
+    decoded_value = unquote(value).strip()
+    channel_id_pattern = re.compile(r"UC[A-Za-z0-9_-]{10,}")
+
+    if channel_id_pattern.fullmatch(decoded_value):
+        return decoded_value
+
+    parsed = urlparse(decoded_value)
+    path_parts = [
+        part
+        for part in unquote(parsed.path).split("/")
+        if part
+    ]
+
+    for index, part in enumerate(path_parts[:-1]):
+        if part.casefold() != "channel":
+            continue
+
+        candidate = path_parts[index + 1]
+
+        if channel_id_pattern.fullmatch(candidate):
+            return candidate
+
+    return None
+
+
+def _youtube_initial_data(html):
+    markers = (
+        "var ytInitialData =",
+        "window[\"ytInitialData\"] =",
+        "ytInitialData =",
+    )
+
+    for marker in markers:
+        marker_position = html.find(marker)
+
+        if marker_position < 0:
+            continue
+
+        json_text = html[marker_position + len(marker):].lstrip()
+
+        try:
+            return json.JSONDecoder().raw_decode(json_text)[0]
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    return None
+
+
+def _youtube_profile_renderers(initial_data):
+    channel_renderers = []
+    microformat_renderers = []
+    canonical_base_urls = []
+
+    def walk(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if (
+                    key == "channelMetadataRenderer"
+                    and isinstance(child, dict)
+                ):
+                    channel_renderers.append(child)
+                elif (
+                    key == "microformatDataRenderer"
+                    and isinstance(child, dict)
+                ):
+                    microformat_renderers.append(child)
+                elif (
+                    key == "canonicalBaseUrl"
+                    and isinstance(child, str)
+                ):
+                    canonical_base_urls.append(child)
+
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    if initial_data is not None:
+        walk(initial_data)
+
+    return (
+        channel_renderers,
+        microformat_renderers,
+        canonical_base_urls,
+    )
+
+
+def classify_youtube_channel_response(username, response, profile_url):
+    status_code = response.status_code
+    final_url = response.url or ""
+    parsed_final_url = urlparse(final_url)
+    final_host = parsed_final_url.netloc.casefold()
+    final_path = unquote(parsed_final_url.path).casefold()
+
+    blocked_hosts = (
+        "consent.youtube.com",
+        "accounts.google.com",
+    )
+    blocked_paths = (
+        "/login",
+        "/signin",
+        "/challenge",
+    )
+
+    if (
+        final_host in blocked_hosts
+        or any(marker in final_path for marker in blocked_paths)
+    ):
+        return (
+            BLOCKED,
+            None,
+            "YouTube consent, login or challenge redirect"
+        )
+
+    if status_code == 429:
+        return (
+            RATE_LIMIT,
+            None,
+            "HTTP 429"
+        )
+
+    if status_code in (401, 403):
+        return (
+            BLOCKED,
+            None,
+            f"HTTP {status_code}"
+        )
+
+    if status_code >= 500:
+        return (
+            ERROR,
+            None,
+            f"HTTP {status_code}"
+        )
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = (
+        soup.title.get_text(" ", strip=True)
+        if soup.title
+        else ""
+    )
+
+    canonical_node = soup.find(
+        "link",
+        rel=lambda value: value and "canonical" in value,
+    )
+    canonical_url = (
+        canonical_node.get("href", "")
+        if canonical_node
+        else ""
+    )
+
+    og_url_node = soup.find(
+        "meta",
+        attrs={"property": "og:url"},
+    )
+    og_url = (
+        og_url_node.get("content", "")
+        if og_url_node
+        else ""
+    )
+
+    og_type_node = soup.find(
+        "meta",
+        attrs={"property": "og:type"},
+    )
+    og_type = (
+        og_type_node.get("content", "")
+        if og_type_node
+        else ""
+    )
+
+    identifier_node = soup.find(
+        "meta",
+        attrs={"itemprop": "identifier"},
+    )
+    identifier = (
+        identifier_node.get("content", "")
+        if identifier_node
+        else ""
+    )
+
+    initial_data = _youtube_initial_data(response.text)
+    (
+        channel_renderers,
+        microformat_renderers,
+        canonical_base_urls,
+    ) = _youtube_profile_renderers(initial_data)
+
+    metadata_handle_values = list(canonical_base_urls)
+    microformat_handle_values = []
+    json_channel_values = []
+
+    for renderer in channel_renderers:
+        owner_urls = renderer.get("ownerUrls", [])
+
+        if isinstance(owner_urls, list):
+            metadata_handle_values.extend(owner_urls)
+
+        metadata_handle_values.append(
+            renderer.get("vanityChannelUrl", "")
+        )
+        json_channel_values.extend((
+            renderer.get("externalId", ""),
+            renderer.get("channelUrl", ""),
+        ))
+
+    for renderer in microformat_renderers:
+        json_channel_values.append(renderer.get("urlCanonical", ""))
+        profile_page = (
+            renderer
+            .get("channelProfileMicroformatDetails", {})
+            .get("profilePage", {})
+        )
+
+        if not isinstance(profile_page, dict):
+            continue
+
+        json_channel_values.append(profile_page.get("url", ""))
+        main_entity = profile_page.get("mainEntity", {})
+
+        if isinstance(main_entity, dict):
+            microformat_handle_values.append(
+                main_entity.get("alternateName", "")
+            )
+            json_channel_values.append(main_entity.get("url", ""))
+
+    metadata_handles = {
+        handle
+        for value in metadata_handle_values
+        if (handle := _youtube_handle_from_value(value))
+    }
+    microformat_handles = {
+        handle
+        for value in microformat_handle_values
+        if (handle := _youtube_handle_from_value(value))
+    }
+    expected_handle = username.casefold()
+    all_handles = metadata_handles | microformat_handles
+    handle_conflict = bool(
+        all_handles
+        and all_handles != {expected_handle}
+    )
+
+    html_channel_ids = {
+        channel_id
+        for value in (canonical_url, og_url, identifier)
+        if (channel_id := _youtube_channel_id_from_value(value))
+    }
+    json_channel_ids = {
+        channel_id
+        for value in json_channel_values
+        if (channel_id := _youtube_channel_id_from_value(value))
+    }
+    all_channel_ids = html_channel_ids | json_channel_ids
+    channel_id_conflict = len(all_channel_ids) > 1
+
+    final_handle = _youtube_handle_from_value(final_url)
+    final_url_matches = _youtube_handle_url_matches(
+        final_url,
+        username,
+    )
+    final_url_conflict = (
+        final_handle is not None
+        and not final_url_matches
+    )
+
+    if final_url_conflict or handle_conflict or channel_id_conflict:
+        return (
+            UNKNOWN,
+            None,
+            "YouTube handle or channel ID conflict"
+        )
+
+    title_is_channel = (
+        title.casefold().endswith(" - youtube")
+        and title.casefold() != "404 not found"
+    )
+    og_type_is_profile = og_type.casefold() == "profile"
+    has_channel_renderer = bool(channel_renderers)
+    metadata_handle_matches = metadata_handles == {expected_handle}
+    microformat_handle_matches = (
+        microformat_handles == {expected_handle}
+    )
+    channel_id_matches = (
+        len(html_channel_ids) == 1
+        and html_channel_ids == json_channel_ids
+    )
+
+    if (
+        status_code == 404
+        and final_url_matches
+        and title.casefold() == "404 not found"
+        and not html_channel_ids
+        and initial_data is None
+        and "ytInitialData" not in response.text
+        and not channel_renderers
+        and not microformat_renderers
+        and not og_type_is_profile
+    ):
+        return (
+            NOT_FOUND,
+            None,
+            "public YouTube channel not found at this handle"
+        )
+
+    if status_code >= 400:
+        return (
+            UNKNOWN,
+            None,
+            f"unconfirmed YouTube HTTP {status_code} response"
+        )
+
+    if status_code != 200 or not final_url_matches:
+        return (
+            UNKNOWN,
+            None,
+            "unexpected YouTube final URL"
+        )
+
+    if (
+        metadata_handle_matches
+        and microformat_handle_matches
+        and channel_id_matches
+        and title_is_channel
+        and og_type_is_profile
+        and has_channel_renderer
+    ):
+        return (
+            FOUND,
+            profile_url,
+            "public YouTube channel found; identity not verified"
+        )
+
+    return (
+        POSSIBLE,
+        profile_url,
+        "incomplete YouTube channel evidence"
+    )
+
+
+# ============================================================
 # SPRAWDZANIE JEDNEGO SERWISU
 # ============================================================
 
@@ -2022,6 +2401,20 @@ def check_username_on_site(username, site_name, site_config):
 
         if checker == "tinder_profile":
             status, link, info = classify_tinder_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return (
+                site_name,
+                status,
+                link,
+                info,
+            )
+
+        if checker == "youtube_channel":
+            status, link, info = classify_youtube_channel_response(
                 username,
                 response,
                 url,
