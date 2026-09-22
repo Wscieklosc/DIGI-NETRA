@@ -1,3 +1,4 @@
+import json
 import unittest
 from unittest.mock import Mock, patch
 
@@ -223,6 +224,165 @@ class XProfileDetectionTests(unittest.TestCase):
                 self.site_name,
                 self.site_config,
             )
+
+        self.assertEqual(result[1], NOT_FOUND)
+
+
+class TikTokProfileDetectionTests(unittest.TestCase):
+    def setUp(self):
+        self.site_name = "TikTok"
+        self.site_config = {
+            "url": "https://www.tiktok.com/@{username}",
+            "checker": "tiktok_profile",
+            "needs_login": True,
+            "rate_limit_delay": 0,
+        }
+
+    def response(self, status_code, text="", url=None):
+        response = Mock()
+        response.status_code = status_code
+        response.text = text
+        response.url = url or "https://www.tiktok.com/@test_user"
+        return response
+
+    def check(self, response, username="test_user"):
+        with (
+            patch(
+                "main.username.requests.request",
+                return_value=response,
+            ),
+            patch("main.username.time.sleep"),
+        ):
+            return check_username_on_site(
+                username,
+                self.site_name,
+                self.site_config,
+            )
+
+    def tiktok_profile_html(
+        self,
+        username="test_user",
+        status_code=0,
+        status_message="",
+    ):
+        data = {
+            "__DEFAULT_SCOPE__": {
+                "webapp.user-detail": {
+                    "userInfo": {
+                        "user": {
+                            "id": "1234567890",
+                            "uniqueId": username,
+                            "secUid": "MS4wLjABAAAA-test",
+                        },
+                        "stats": {
+                            "followerCount": 1,
+                        },
+                    },
+                    "shareMeta": {
+                        "desc": (
+                            f"@{username} 1 Followers, 0 Following, "
+                            "0 Likes"
+                        ),
+                    },
+                    "statusCode": status_code,
+                    "statusMsg": status_message,
+                },
+            },
+        }
+
+        return (
+            '<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" '
+            f'type="application/json">{json.dumps(data)}</script>'
+        )
+
+    def tiktok_status_html(self, status_code, status_message=""):
+        data = {
+            "__DEFAULT_SCOPE__": {
+                "webapp.user-detail": {
+                    "statusCode": status_code,
+                    "statusMsg": status_message,
+                },
+            },
+        }
+
+        return (
+            '<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" '
+            f'type="application/json">{json.dumps(data)}</script>'
+        )
+
+    def test_tiktok_matching_embedded_profile_is_found(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.tiktok_profile_html(),
+            )
+        )
+
+        self.assertEqual(result[1], FOUND)
+
+    def test_tiktok_private_profile_data_is_found(self):
+        username = "a12345678901234567890123"
+        result = self.check(
+            self.response(
+                200,
+                text=self.tiktok_profile_html(
+                    username,
+                    status_code=10222,
+                    status_message="ErrBizUserSecret",
+                ),
+                url=f"https://www.tiktok.com/@{username}",
+            ),
+            username=username,
+        )
+
+        self.assertEqual(result[1], FOUND)
+
+    def test_tiktok_bare_200_remains_possible(self):
+        result = self.check(self.response(200, text="<html></html>"))
+
+        self.assertEqual(result[1], POSSIBLE)
+
+    def test_tiktok_mismatched_embedded_profile_remains_possible(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.tiktok_profile_html("another_user"),
+            )
+        )
+
+        self.assertEqual(result[1], POSSIBLE)
+
+    def test_tiktok_missing_profile_is_not_found(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.tiktok_status_html(10221),
+            )
+        )
+
+        self.assertEqual(result[1], NOT_FOUND)
+
+    def test_tiktok_banned_status_is_blocked(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.tiktok_status_html(
+                    10221,
+                    "user banned",
+                ),
+            )
+        )
+
+        self.assertEqual(result[1], BLOCKED)
+
+    def test_tiktok_trailing_period_is_not_found(self):
+        result = self.check(
+            self.response(
+                200,
+                url="https://www.tiktok.com/@testname.",
+            ),
+            username="testname.",
+        )
 
         self.assertEqual(result[1], NOT_FOUND)
 

@@ -182,6 +182,196 @@ def classify_x_profile_response(username, response, profile_url):
 
 
 # ============================================================
+# SPECJALNA DETEKCJA PROFILI TIKTOK
+# ============================================================
+
+def _tiktok_profile_url_matches(value, username):
+    if not value:
+        return False
+
+    parsed = urlparse(value)
+
+    return (
+        parsed.scheme == "https"
+        and parsed.netloc.lower()
+        in ("tiktok.com", "www.tiktok.com")
+        and unquote(parsed.path).strip("/").casefold()
+        == f"@{username}".casefold()
+    )
+
+
+def _tiktok_username_format_is_valid(username):
+    return (
+        bool(username)
+        and not username.endswith(".")
+        and all(
+            character.isalnum() or character in "_."
+            for character in username
+        )
+    )
+
+
+def classify_tiktok_profile_response(username, response, profile_url):
+    if not _tiktok_username_format_is_valid(username):
+        return (
+            NOT_FOUND,
+            None,
+            "invalid TikTok username format"
+        )
+
+    final_url_matches = _tiktok_profile_url_matches(
+        response.url,
+        username,
+    )
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    data_node = soup.find(
+        "script",
+        id="__UNIVERSAL_DATA_FOR_REHYDRATION__",
+    )
+
+    if data_node is None:
+        if 200 <= response.status_code < 300 and final_url_matches:
+            return (
+                POSSIBLE,
+                profile_url,
+                "TikTok profile data missing"
+            )
+
+        return (
+            UNKNOWN,
+            None,
+            "unrecognized TikTok response"
+        )
+
+    try:
+        page_data = json.loads(
+            data_node.string or data_node.get_text()
+        )
+    except (TypeError, json.JSONDecodeError):
+        return (
+            UNKNOWN,
+            None,
+            "invalid TikTok profile data"
+        )
+
+    default_scope = page_data.get("__DEFAULT_SCOPE__", {})
+    user_detail = default_scope.get("webapp.user-detail")
+
+    if not isinstance(user_detail, dict):
+        return (
+            POSSIBLE,
+            profile_url if final_url_matches else None,
+            "TikTok user detail missing"
+        )
+
+    user_info = user_detail.get("userInfo")
+    user = (
+        user_info.get("user")
+        if isinstance(user_info, dict)
+        else None
+    )
+    stats = (
+        user_info.get("stats")
+        if isinstance(user_info, dict)
+        else None
+    )
+    share_meta = user_detail.get("shareMeta")
+
+    unique_id = (
+        user.get("uniqueId", "")
+        if isinstance(user, dict)
+        else ""
+    )
+    user_id = (
+        str(user.get("id", ""))
+        if isinstance(user, dict)
+        else ""
+    )
+    sec_uid = (
+        user.get("secUid", "")
+        if isinstance(user, dict)
+        else ""
+    )
+    share_description = (
+        share_meta.get("desc", "")
+        if isinstance(share_meta, dict)
+        else ""
+    )
+
+    identity_matches = (
+        unique_id.casefold() == username.casefold()
+        and user_id.isdigit()
+        and bool(sec_uid)
+        and isinstance(stats, dict)
+        and share_description.casefold().startswith(
+            f"@{username} ".casefold()
+        )
+    )
+
+    if (
+        response.status_code == 200
+        and final_url_matches
+        and identity_matches
+    ):
+        return (
+            FOUND,
+            profile_url,
+            "TikTok embedded profile data confirmed"
+        )
+
+    status_code = user_detail.get("statusCode")
+    status_message = str(
+        user_detail.get("statusMsg", "")
+    ).strip()
+    status_message_lower = status_message.casefold()
+
+    blocked_markers = (
+        "banned",
+        "suspend",
+        "captcha",
+        "challenge",
+        "login",
+    )
+
+    if any(
+        marker in status_message_lower
+        for marker in blocked_markers
+    ):
+        return (
+            BLOCKED,
+            None,
+            f"TikTok status: {status_message}"
+        )
+
+    if (
+        status_code == 10221
+        and not status_message
+        and not isinstance(user_info, dict)
+        and not isinstance(share_meta, dict)
+        and final_url_matches
+    ):
+        return (
+            NOT_FOUND,
+            None,
+            "TikTok user-detail status 10221"
+        )
+
+    if 200 <= response.status_code < 300 and final_url_matches:
+        return (
+            POSSIBLE,
+            profile_url,
+            "incomplete TikTok profile data"
+        )
+
+    return (
+        UNKNOWN,
+        None,
+        "unrecognized TikTok response"
+    )
+
+
+# ============================================================
 # SPRAWDZANIE JEDNEGO SERWISU
 # ============================================================
 
@@ -335,11 +525,25 @@ def check_username_on_site(username, site_name, site_config):
             )
 
         # ----------------------------------------------------
-        # SPECJALNY CHECKER X
+        # SPECJALNE CHECKERY SERWISOW
         # ----------------------------------------------------
 
         if checker == "x_profile":
             status, link, info = classify_x_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return (
+                site_name,
+                status,
+                link,
+                info,
+            )
+
+        if checker == "tiktok_profile":
+            status, link, info = classify_tiktok_profile_response(
                 username,
                 response,
                 url,
