@@ -201,6 +201,26 @@
     "redirect_behavior": "follow",
     "confidence_score": 0.99
   },
+  "XNXX": {
+    "url": "https://www.xnxx.com/pornstar/{username}",
+    "checker": "xnxx_profile",
+    "category": "adult",
+    "sensitive": true,
+    "detect_based_on_message": false,
+    "not_found_status_codes": [],
+    "not_found_message": "",
+    "found_message": "",
+    "request_method": "GET",
+    "headers": {
+      "User-Agent": "Mozilla/5.0"
+    },
+    "timeout_seconds": 15,
+    "rate_limit_delay": 2,
+    "needs_login": false,
+    "custom_error_handling": true,
+    "redirect_behavior": "follow",
+    "confidence_score": 0.99
+  },
   "Pinterest": {
     "url": "https://www.pinterest.com/{username}/",
     "detect_based_on_message": true,

@@ -515,6 +515,175 @@ class XVideosProfileDetectionTests(unittest.TestCase):
         self.assertEqual(result[1], RATE_LIMIT)
 
 
+class XNXXProfileDetectionTests(unittest.TestCase):
+    def setUp(self):
+        self.site_name = "XNXX"
+        self.site_config = {
+            "url": "https://www.xnxx.com/pornstar/{username}",
+            "checker": "xnxx_profile",
+            "category": "adult",
+            "sensitive": True,
+            "rate_limit_delay": 0,
+        }
+
+    def response(self, status_code, text="", url=None):
+        response = Mock()
+        response.status_code = status_code
+        response.text = text
+        response.url = (
+            url
+            or "https://www.xnxx.com/pornstar/test_user"
+        )
+        return response
+
+    def check(self, response, username="test_user"):
+        with (
+            patch(
+                "main.username.requests.request",
+                return_value=response,
+            ),
+            patch("main.username.time.sleep"),
+        ):
+            return check_username_on_site(
+                username,
+                self.site_name,
+                self.site_config,
+            )
+
+    def profile_html(self, user_overrides=None, include_user=True):
+        user = {
+            "id_user": "123456789",
+            "username": "test_user",
+            "display": "Test User",
+            "model": True,
+            "url": "/pornstar/test_user",
+        }
+        user.update(user_overrides or {})
+        data = {"action": "profile"}
+
+        if include_user:
+            data["user"] = user
+
+        config = {"data": data}
+
+        return f"""
+            <html>
+                <head>
+                    <title>Test User - Model page - XNXX.COM</title>
+                    <link
+                        rel="alternate"
+                        hreflang="x-default"
+                        href="https://www.xnxx.com/pornstar/test_user"
+                    >
+                </head>
+                <body class="profile-page">
+                    <h2 id="profile-info-title">
+                        <span class="profile-username">Test User</span>
+                    </h2>
+                    <script>
+                        window.xv.conf = {json.dumps(config)};
+                    </script>
+                </body>
+            </html>
+        """
+
+    def test_xnxx_complete_public_model_profile_is_found(self):
+        result = self.check(
+            self.response(200, text=self.profile_html())
+        )
+
+        self.assertEqual(result[1], FOUND)
+        self.assertEqual(
+            result[3],
+            "public XNXX model profile found; identity not verified",
+        )
+
+    def test_xnxx_missing_data_user_does_not_return_found(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.profile_html(include_user=False),
+            )
+        )
+
+        self.assertEqual(result[1], POSSIBLE)
+        self.assertNotEqual(result[1], FOUND)
+
+    def test_xnxx_wrong_embedded_username_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.profile_html(
+                    {"username": "other_user"},
+                ),
+            )
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_xnxx_wrong_embedded_profile_url_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.profile_html(
+                    {"url": "/pornstar/other_user"},
+                ),
+            )
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_xnxx_missing_profile_id_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.profile_html({"id_user": ""}),
+            )
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_xnxx_non_model_account_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.profile_html({"model": False}),
+            )
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_xnxx_confirmed_missing_profile_is_not_found(self):
+        config = {"data": {"action": "profile"}}
+        html = f"""
+            <html>
+                <head>
+                    <title>Unknown profile - XNXX.COM</title>
+                </head>
+                <body>
+                    <h2>THIS PROFILE DOESN'T EXIST !</h2>
+                    <script>
+                        window.xv.conf = {json.dumps(config)};
+                    </script>
+                </body>
+            </html>
+        """
+        result = self.check(self.response(404, text=html))
+
+        self.assertEqual(result[1], NOT_FOUND)
+        self.assertIn("no public XNXX model profile", result[3])
+
+    def test_xnxx_403_is_blocked(self):
+        result = self.check(self.response(403))
+
+        self.assertEqual(result[1], BLOCKED)
+
+    def test_xnxx_429_is_rate_limited(self):
+        result = self.check(self.response(429))
+
+        self.assertEqual(result[1], RATE_LIMIT)
+
+
 class FanslyProfileDetectionTests(unittest.TestCase):
     def setUp(self):
         self.site_name = "Fansly"

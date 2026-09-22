@@ -611,6 +611,304 @@ def classify_xvideos_profile_response(username, response, profile_url):
 
 
 # ============================================================
+# SPECJALNA DETEKCJA PUBLICZNYCH PROFILI XNXX
+# ============================================================
+
+def _xnxx_profile_url_matches(value, username):
+    if not value:
+        return False
+
+    parsed = urlparse(value)
+
+    return (
+        parsed.scheme == "https"
+        and parsed.netloc.casefold() in ("xnxx.com", "www.xnxx.com")
+        and unquote(parsed.path).rstrip("/")
+        == f"/pornstar/{username}"
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
+def _extract_xnxx_conf(page_text):
+    marker = "window.xv.conf"
+    marker_position = page_text.find(marker)
+
+    if marker_position < 0:
+        return None, False
+
+    object_position = page_text.find("{", marker_position + len(marker))
+
+    if object_position < 0:
+        return None, True
+
+    try:
+        config, _ = json.JSONDecoder().raw_decode(
+            page_text[object_position:]
+        )
+    except (TypeError, ValueError):
+        return None, True
+
+    return config if isinstance(config, dict) else None, True
+
+
+def classify_xnxx_profile_response(username, response, profile_url):
+    status_code = response.status_code
+
+    if status_code == 429:
+        return (
+            RATE_LIMIT,
+            None,
+            "HTTP 429"
+        )
+
+    if status_code in (401, 403):
+        return (
+            BLOCKED,
+            None,
+            f"HTTP {status_code}"
+        )
+
+    if status_code >= 500:
+        return (
+            ERROR,
+            None,
+            f"HTTP {status_code}"
+        )
+
+    final_url_lower = response.url.casefold()
+    block_url_markers = (
+        "/login",
+        "/signin",
+        "/challenge",
+        "/captcha",
+    )
+
+    if any(
+        marker in final_url_lower
+        for marker in block_url_markers
+    ):
+        return (
+            BLOCKED,
+            None,
+            "XNXX login or challenge redirect"
+        )
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = (
+        " ".join(soup.title.get_text(" ", strip=True).split())
+        if soup.title
+        else ""
+    )
+    title_lower = title.casefold()
+    blocked_title_markers = (
+        "access denied",
+        "captcha",
+        "challenge",
+        "just a moment",
+        "log in",
+        "sign in",
+    )
+
+    if any(
+        marker in title_lower
+        for marker in blocked_title_markers
+    ):
+        return (
+            BLOCKED,
+            None,
+            "XNXX access challenge"
+        )
+
+    final_url_matches = _xnxx_profile_url_matches(
+        response.url,
+        username,
+    )
+
+    alternate = soup.find(
+        "link",
+        attrs={"hreflang": "x-default"},
+    )
+    alternate_url = alternate.get("href", "") if alternate else ""
+
+    if alternate_url and not _xnxx_profile_url_matches(
+        urljoin(response.url, alternate_url),
+        username,
+    ):
+        return (
+            UNKNOWN,
+            None,
+            "XNXX x-default URL conflicts with the username"
+        )
+
+    config, config_marker_seen = _extract_xnxx_conf(response.text)
+    data = config.get("data") if isinstance(config, dict) else None
+    action = data.get("action") if isinstance(data, dict) else None
+    user = data.get("user") if isinstance(data, dict) else None
+
+    not_found_heading = soup.find(
+        ["h1", "h2"],
+        string=lambda value: (
+            value
+            and " ".join(value.split()).casefold()
+            == "this profile doesn't exist !"
+        ),
+    )
+
+    if status_code == 404:
+        if (
+            final_url_matches
+            and "unknown profile" in title_lower
+            and not_found_heading is not None
+            and user is None
+        ):
+            return (
+                NOT_FOUND,
+                None,
+                "no public XNXX model profile at this path"
+            )
+
+        return (
+            UNKNOWN,
+            None,
+            "unconfirmed XNXX 404 response"
+        )
+
+    if status_code >= 400:
+        return (
+            UNKNOWN,
+            None,
+            f"HTTP {status_code}"
+        )
+
+    if status_code != 200 or not final_url_matches:
+        return (
+            UNKNOWN,
+            None,
+            "unexpected XNXX final URL"
+        )
+
+    if config_marker_seen and config is None:
+        return (
+            UNKNOWN,
+            None,
+            "invalid XNXX embedded profile data"
+        )
+
+    if action is not None and action != "profile":
+        return (
+            UNKNOWN,
+            None,
+            "XNXX embedded action conflicts with a profile page"
+        )
+
+    if user is not None:
+        if not isinstance(user, dict):
+            return (
+                UNKNOWN,
+                None,
+                "invalid XNXX embedded user data"
+            )
+
+        if user.get("username") != username:
+            return (
+                UNKNOWN,
+                None,
+                "XNXX embedded username conflicts with the request"
+            )
+
+        if user.get("url") != f"/pornstar/{username}":
+            return (
+                UNKNOWN,
+                None,
+                "XNXX embedded profile URL conflicts with the request"
+            )
+
+        user_id = user.get("id_user")
+
+        if not user_id or not str(user_id).strip():
+            return (
+                UNKNOWN,
+                None,
+                "XNXX embedded profile id is missing"
+            )
+
+        if user.get("model") is not True:
+            return (
+                UNKNOWN,
+                None,
+                "XNXX embedded account is not a model profile"
+            )
+
+    profile_title_matches = bool(
+        re.fullmatch(
+            r".+\s+-\s+model page\s+-\s+xnxx\.com",
+            title,
+            re.IGNORECASE,
+        )
+    )
+    body_classes = soup.body.get("class", []) if soup.body else []
+    profile_body = "profile-page" in body_classes
+    profile_heading_node = soup.select_one("#profile-info-title")
+    profile_heading = soup.select_one(
+        "h1#profile-info-title, h2#profile-info-title"
+    )
+    profile_username_marker = (
+        profile_heading.select_one(".profile-username")
+        if profile_heading
+        else None
+    )
+    profile_username_text = (
+        " ".join(
+            profile_username_marker.get_text(" ", strip=True).split()
+        )
+        if profile_username_marker
+        else ""
+    )
+
+    if title and not profile_title_matches:
+        return (
+            UNKNOWN,
+            None,
+            "XNXX title conflicts with a model profile"
+        )
+
+    if soup.body and body_classes and not profile_body:
+        return (
+            UNKNOWN,
+            None,
+            "XNXX body marker conflicts with a profile page"
+        )
+
+    if profile_heading_node is not None and profile_heading is None:
+        return (
+            UNKNOWN,
+            None,
+            "XNXX profile heading has an unexpected structure"
+        )
+
+    if (
+        profile_title_matches
+        and profile_body
+        and profile_heading is not None
+        and bool(profile_username_text)
+        and action == "profile"
+        and isinstance(user, dict)
+    ):
+        return (
+            FOUND,
+            profile_url,
+            "public XNXX model profile found; identity not verified"
+        )
+
+    return (
+        POSSIBLE,
+        profile_url,
+        "incomplete XNXX model profile evidence"
+    )
+
+
+# ============================================================
 # SPECJALNA DETEKCJA PUBLICZNYCH PROFILI FANSLY
 # ============================================================
 
@@ -1353,6 +1651,20 @@ def check_username_on_site(username, site_name, site_config):
         # dlatego checker dziala przed generyczna klasyfikacja HTTP.
         if checker == "xvideos_profile":
             status, link, info = classify_xvideos_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return (
+                site_name,
+                status,
+                link,
+                info,
+            )
+
+        if checker == "xnxx_profile":
+            status, link, info = classify_xnxx_profile_response(
                 username,
                 response,
                 url,
