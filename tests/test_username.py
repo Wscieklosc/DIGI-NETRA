@@ -807,5 +807,172 @@ class PornhubProfileDetectionTests(unittest.TestCase):
         self.assertEqual(result[1], RATE_LIMIT)
 
 
+class TinderProfileDetectionTests(unittest.TestCase):
+    def setUp(self):
+        self.site_name = "Tinder"
+        self.site_config = {
+            "url": "https://tinder.com/@{username}",
+            "checker": "tinder_profile",
+            "category": "dating",
+            "sensitive": True,
+            "rate_limit_delay": 0,
+        }
+
+    def response(self, status_code, text="", url=None):
+        response = Mock()
+        response.status_code = status_code
+        response.text = text
+        response.url = url or "https://tinder.com/@test_user"
+        return response
+
+    def check(self, response, username="test_user"):
+        with (
+            patch(
+                "main.username.requests.request",
+                return_value=response,
+            ),
+            patch("main.username.time.sleep"),
+        ):
+            return check_username_on_site(
+                username,
+                self.site_name,
+                self.site_config,
+            )
+
+    def profile_html(
+        self,
+        username="test_user",
+        canonical_username=None,
+        og_username=None,
+        title_username=None,
+        person_username=None,
+    ):
+        canonical_username = canonical_username or username
+        og_username = og_username or username
+        title_username = title_username or username
+        person_username = person_username or username
+        person = {
+            "@context": "https://schema.org/",
+            "@type": "Person",
+            "name": "Test User",
+            "alternateName": person_username,
+        }
+
+        return f"""
+            <html>
+                <head>
+                    <title>Test User (@{title_username}) | Tinder</title>
+                    <link
+                        rel="canonical"
+                        href="https://tinder.com/@{canonical_username}"
+                    >
+                    <meta
+                        property="og:url"
+                        content="https://tinder.com/@{og_username}"
+                    >
+                    <script type="application/ld+json">
+                        {json.dumps(person)}
+                    </script>
+                </head>
+            </html>
+        """
+
+    def test_tinder_complete_public_profile_is_found(self):
+        result = self.check(
+            self.response(200, text=self.profile_html())
+        )
+
+        self.assertEqual(result[1], FOUND)
+        self.assertIn("identity not verified", result[3])
+
+    def test_tinder_incomplete_200_is_possible(self):
+        result = self.check(
+            self.response(200, text="<html></html>")
+        )
+
+        self.assertEqual(result[1], POSSIBLE)
+
+    def test_tinder_wrong_final_url_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.profile_html(),
+                url="https://tinder.com/@other_user",
+            )
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_tinder_wrong_canonical_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.profile_html(
+                    canonical_username="other_user",
+                ),
+            )
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_tinder_wrong_og_url_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.profile_html(
+                    og_username="other_user",
+                ),
+            )
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_tinder_mismatched_username_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.profile_html(
+                    title_username="other_user",
+                    person_username="other_user",
+                ),
+            )
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_tinder_home_page_is_unknown(self):
+        home_html = """
+            <html>
+                <head>
+                    <title>
+                        Tinder | Dating, Make Friends & Meet New People
+                    </title>
+                    <link rel="canonical" href="https://tinder.com">
+                    <meta property="og:url" content="https://tinder.com">
+                </head>
+            </html>
+        """
+        result = self.check(
+            self.response(
+                200,
+                text=home_html,
+                url="https://tinder.com/",
+            )
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+        self.assertIn("account existence unknown", result[3])
+
+    def test_tinder_403_is_blocked(self):
+        result = self.check(self.response(403))
+
+        self.assertEqual(result[1], BLOCKED)
+
+    def test_tinder_429_is_rate_limited(self):
+        result = self.check(self.response(429))
+
+        self.assertEqual(result[1], RATE_LIMIT)
+
+
 if __name__ == "__main__":
     unittest.main()

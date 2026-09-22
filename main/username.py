@@ -1013,6 +1013,272 @@ def classify_pornhub_profile_response(username, response, profile_url):
 
 
 # ============================================================
+# SPECJALNA DETEKCJA PUBLICZNYCH PROFILI TINDER
+# ============================================================
+
+def _tinder_url_matches(value, expected_path):
+    if not value:
+        return False
+
+    parsed = urlparse(value)
+
+    return (
+        parsed.scheme == "https"
+        and parsed.netloc.casefold()
+        in ("tinder.com", "www.tinder.com")
+        and unquote(parsed.path).rstrip("/").casefold()
+        == expected_path.rstrip("/").casefold()
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
+def _tinder_json_ld_people(soup):
+    people = []
+
+    for node in soup.find_all(
+        "script",
+        attrs={"type": "application/ld+json"},
+    ):
+        try:
+            payload = json.loads(node.string or node.get_text())
+        except (TypeError, ValueError):
+            continue
+
+        values = payload if isinstance(payload, list) else [payload]
+
+        for value in values:
+            if not isinstance(value, dict):
+                continue
+
+            candidates = [value]
+            graph = value.get("@graph")
+            if isinstance(graph, list):
+                candidates.extend(graph)
+
+            for candidate in candidates:
+                if (
+                    isinstance(candidate, dict)
+                    and candidate.get("@type") == "Person"
+                ):
+                    people.append(candidate)
+
+    return people
+
+
+def classify_tinder_profile_response(username, response, profile_url):
+    status_code = response.status_code
+    profile_path = f"/@{username}"
+
+    if status_code == 429:
+        return (
+            RATE_LIMIT,
+            None,
+            "HTTP 429"
+        )
+
+    if status_code in (401, 403):
+        return (
+            BLOCKED,
+            None,
+            f"HTTP {status_code}"
+        )
+
+    if status_code >= 500:
+        return (
+            ERROR,
+            None,
+            f"HTTP {status_code}"
+        )
+
+    final_url_lower = response.url.casefold()
+    block_url_markers = (
+        "/login",
+        "/signin",
+        "/auth",
+        "/challenge",
+        "/captcha",
+    )
+
+    if any(
+        marker in final_url_lower
+        for marker in block_url_markers
+    ):
+        return (
+            BLOCKED,
+            None,
+            "Tinder login or challenge redirect"
+        )
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = (
+        " ".join(soup.title.get_text(" ", strip=True).split())
+        if soup.title
+        else ""
+    )
+    title_lower = title.casefold()
+    blocked_title_markers = (
+        "access denied",
+        "captcha",
+        "challenge",
+        "just a moment",
+        "log in",
+        "sign in",
+    )
+
+    if any(
+        marker in title_lower
+        for marker in blocked_title_markers
+    ):
+        return (
+            BLOCKED,
+            None,
+            "Tinder access challenge"
+        )
+
+    canonical = soup.find("link", rel="canonical")
+    canonical_url = (
+        canonical.get("href", "")
+        if canonical
+        else ""
+    )
+    og_url_node = soup.find(
+        "meta",
+        attrs={"property": "og:url"},
+    )
+    og_url = (
+        og_url_node.get("content", "")
+        if og_url_node
+        else ""
+    )
+
+    final_url_matches = _tinder_url_matches(
+        response.url,
+        profile_path,
+    )
+    canonical_matches = _tinder_url_matches(
+        canonical_url,
+        profile_path,
+    )
+    og_url_matches = _tinder_url_matches(
+        og_url,
+        profile_path,
+    )
+    final_url_is_home = _tinder_url_matches(
+        response.url,
+        "/",
+    )
+    canonical_is_home = _tinder_url_matches(
+        canonical_url,
+        "/",
+    )
+    og_url_is_home = _tinder_url_matches(
+        og_url,
+        "/",
+    )
+
+    exact_title_username = bool(
+        re.search(
+            rf"(?<![\w])@{re.escape(username)}(?![\w])",
+            title,
+            re.IGNORECASE,
+        )
+    )
+    title_usernames = re.findall(
+        r"@([A-Za-z0-9._-]+)",
+        title,
+    )
+    title_username_conflict = (
+        bool(title_usernames)
+        and not exact_title_username
+    )
+
+    people = _tinder_json_ld_people(soup)
+    matching_people = [
+        person
+        for person in people
+        if (
+            isinstance(person.get("alternateName"), str)
+            and person["alternateName"].casefold()
+            == username.casefold()
+        )
+    ]
+    person_username_conflict = (
+        bool(people)
+        and not matching_people
+    )
+
+    general_page_without_profile = (
+        (final_url_is_home or canonical_is_home or og_url_is_home)
+        and canonical_is_home
+        and og_url_is_home
+        and not people
+        and not exact_title_username
+    )
+
+    if general_page_without_profile:
+        return (
+            UNKNOWN,
+            None,
+            "no public Tinder profile exposed; account existence unknown"
+        )
+
+    if status_code >= 400:
+        return (
+            UNKNOWN,
+            None,
+            f"HTTP {status_code}"
+        )
+
+    if status_code != 200 or not final_url_matches:
+        return (
+            UNKNOWN,
+            None,
+            "unexpected Tinder final URL"
+        )
+
+    if canonical_url and not canonical_matches:
+        return (
+            UNKNOWN,
+            None,
+            "Tinder canonical does not match the profile"
+        )
+
+    if og_url and not og_url_matches:
+        return (
+            UNKNOWN,
+            None,
+            "Tinder og:url does not match the profile"
+        )
+
+    if title_username_conflict or person_username_conflict:
+        return (
+            UNKNOWN,
+            None,
+            "Tinder profile markers identify another username"
+        )
+
+    if (
+        canonical_matches
+        and og_url_matches
+        and exact_title_username
+        and len(matching_people) == 1
+    ):
+        return (
+            FOUND,
+            profile_url,
+            "public Tinder profile found under this username; "
+            "identity not verified"
+        )
+
+    return (
+        POSSIBLE,
+        profile_url,
+        "incomplete Tinder profile evidence"
+    )
+
+
+# ============================================================
 # SPRAWDZANIE JEDNEGO SERWISU
 # ============================================================
 
@@ -1114,6 +1380,20 @@ def check_username_on_site(username, site_name, site_config):
 
         if checker == "pornhub_profile":
             status, link, info = classify_pornhub_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return (
+                site_name,
+                status,
+                link,
+                info,
+            )
+
+        if checker == "tinder_profile":
+            status, link, info = classify_tinder_profile_response(
                 username,
                 response,
                 url,
