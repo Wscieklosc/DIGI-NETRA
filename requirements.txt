@@ -2,3 +2,4 @@ pyfiglet
 rich
 requests
 
+beautifulsoup4
