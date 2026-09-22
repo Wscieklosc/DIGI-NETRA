@@ -11,6 +11,7 @@ from main.username import (
     NOT_FOUND,
     POSSIBLE,
     RATE_LIMIT,
+    UNKNOWN,
     check_username_on_site,
 )
 
@@ -385,6 +386,133 @@ class TikTokProfileDetectionTests(unittest.TestCase):
         )
 
         self.assertEqual(result[1], NOT_FOUND)
+
+
+class XVideosProfileDetectionTests(unittest.TestCase):
+    def setUp(self):
+        self.site_name = "XVideos"
+        self.site_config = {
+            "url": "https://www.xvideos.com/profiles/{username}",
+            "checker": "xvideos_profile",
+            "category": "adult",
+            "sensitive": True,
+            "rate_limit_delay": 0,
+        }
+
+    def response(self, status_code, text="", url=None):
+        response = Mock()
+        response.status_code = status_code
+        response.text = text
+        response.url = (
+            url
+            or "https://www.xvideos.com/profiles/test_user"
+        )
+        return response
+
+    def check(self, response, username="test_user"):
+        with (
+            patch(
+                "main.username.requests.request",
+                return_value=response,
+            ),
+            patch("main.username.time.sleep"),
+        ):
+            return check_username_on_site(
+                username,
+                self.site_name,
+                self.site_config,
+            )
+
+    def profile_html(self, username="test_user"):
+        return f"""
+            <html>
+                <head>
+                    <title>
+                        {username} - Profile page - XVIDEOS.COM
+                    </title>
+                </head>
+                <body>
+                    <div id="profile-title">
+                        <h2>{username} Profile details</h2>
+                    </div>
+                    <a href="/profiles/{username}">Profile</a>
+                </body>
+            </html>
+        """
+
+    def test_xvideos_complete_public_profile_is_found(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.profile_html(),
+            )
+        )
+
+        self.assertEqual(result[1], FOUND)
+        self.assertIn("identity not verified", result[3])
+
+    def test_xvideos_bare_200_remains_possible(self):
+        result = self.check(
+            self.response(200, text="<html></html>")
+        )
+
+        self.assertEqual(result[1], POSSIBLE)
+
+    def test_xvideos_wrong_final_url_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.profile_html(),
+                url="https://www.xvideos.com/profiles/other_user",
+            )
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_xvideos_mismatched_username_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.profile_html("other_user"),
+            )
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+        self.assertIn("another username", result[3])
+
+    def test_xvideos_confirmed_missing_profile_is_not_found(self):
+        html = """
+            <html>
+                <head>
+                    <title>Unknown profile - XVIDEOS.COM</title>
+                </head>
+                <body>
+                    <h1>THIS PROFILE DOESN'T EXIST!</h1>
+                </body>
+            </html>
+        """
+
+        result = self.check(self.response(404, text=html))
+
+        self.assertEqual(result[1], NOT_FOUND)
+        self.assertIn("no public XVideos profile", result[3])
+
+    def test_xvideos_unconfirmed_404_is_unknown(self):
+        result = self.check(
+            self.response(404, text="<html></html>")
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_xvideos_403_is_blocked(self):
+        result = self.check(self.response(403))
+
+        self.assertEqual(result[1], BLOCKED)
+
+    def test_xvideos_429_is_rate_limited(self):
+        result = self.check(self.response(429))
+
+        self.assertEqual(result[1], RATE_LIMIT)
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@ import requests
 from bs4 import BeautifulSoup
 from rich import print
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import quote, unquote, urljoin, urlparse
 
 from .instaemailfind import instafind as infind
 from .scrap import chess
@@ -372,6 +372,245 @@ def classify_tiktok_profile_response(username, response, profile_url):
 
 
 # ============================================================
+# SPECJALNA DETEKCJA PUBLICZNYCH PROFILI XVIDEOS
+# ============================================================
+
+def _xvideos_profile_url_matches(value, username):
+    if not value:
+        return False
+
+    parsed = urlparse(value)
+
+    return (
+        parsed.scheme == "https"
+        and parsed.netloc.lower()
+        in ("xvideos.com", "www.xvideos.com")
+        and unquote(parsed.path).rstrip("/").casefold()
+        == f"/profiles/{username}".casefold()
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
+def classify_xvideos_profile_response(username, response, profile_url):
+    status_code = response.status_code
+    final_url_matches = _xvideos_profile_url_matches(
+        response.url,
+        username,
+    )
+
+    if status_code == 429:
+        return (
+            RATE_LIMIT,
+            None,
+            "HTTP 429"
+        )
+
+    if status_code in (401, 403):
+        return (
+            BLOCKED,
+            None,
+            f"HTTP {status_code}"
+        )
+
+    final_url_lower = response.url.casefold()
+    block_url_markers = (
+        "/login",
+        "/signin",
+        "/challenge",
+        "/captcha",
+    )
+
+    if any(
+        marker in final_url_lower
+        for marker in block_url_markers
+    ):
+        return (
+            BLOCKED,
+            None,
+            "XVideos login or challenge redirect"
+        )
+
+    if status_code >= 500:
+        return (
+            ERROR,
+            None,
+            f"HTTP {status_code}"
+        )
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = (
+        soup.title.get_text(" ", strip=True)
+        if soup.title
+        else ""
+    )
+    normalized_title = " ".join(title.split())
+
+    blocked_title_markers = (
+        "access denied",
+        "captcha",
+        "challenge",
+        "just a moment",
+        "log in",
+        "sign in",
+    )
+
+    if any(
+        marker in normalized_title.casefold()
+        for marker in blocked_title_markers
+    ):
+        return (
+            BLOCKED,
+            None,
+            "XVideos access challenge"
+        )
+
+    not_found_heading = soup.find(
+        "h1",
+        string=lambda value: (
+            value
+            and "this profile doesn't exist"
+            in " ".join(value.split()).casefold()
+        ),
+    )
+    not_found_title = (
+        "unknown profile" in normalized_title.casefold()
+    )
+
+    if status_code == 404:
+        if (
+            final_url_matches
+            and not_found_title
+            and not_found_heading is not None
+        ):
+            return (
+                NOT_FOUND,
+                None,
+                "no public XVideos profile at this username"
+            )
+
+        return (
+            UNKNOWN,
+            None,
+            "unconfirmed XVideos 404 response"
+        )
+
+    if status_code >= 400:
+        return (
+            UNKNOWN,
+            None,
+            f"HTTP {status_code}"
+        )
+
+    profile_title = soup.find(id="profile-title")
+    profile_heading = (
+        profile_title.find(["h1", "h2"])
+        if profile_title
+        else None
+    )
+    profile_heading_text = (
+        " ".join(
+            profile_heading.get_text(" ", strip=True).split()
+        )
+        if profile_heading
+        else ""
+    )
+
+    title_pattern = re.compile(
+        rf"^{re.escape(username)}\s+-\s+profile page\s+-\s+"
+        r"xvideos\.com$",
+        re.IGNORECASE,
+    )
+    heading_pattern = re.compile(
+        rf"^{re.escape(username)}(?:\s|$)",
+        re.IGNORECASE,
+    )
+
+    title_matches = bool(
+        title_pattern.fullmatch(normalized_title)
+    )
+    heading_matches = bool(
+        heading_pattern.search(profile_heading_text)
+    )
+    exact_profile_link = any(
+        _xvideos_profile_url_matches(
+            urljoin(response.url, node.get("href", "")),
+            username,
+        )
+        for node in soup.find_all("a", href=True)
+    )
+
+    profile_title_match = re.fullmatch(
+        r"(?P<username>.+?)\s+-\s+profile page\s+-\s+"
+        r"xvideos\.com",
+        normalized_title,
+        re.IGNORECASE,
+    )
+    marker_username = (
+        profile_title_match.group("username").strip()
+        if profile_title_match
+        else ""
+    )
+    conflicting_profile_markers = (
+        marker_username
+        and marker_username.casefold() != username.casefold()
+        and profile_title is not None
+        and bool(
+            re.match(
+                rf"^{re.escape(marker_username)}(?:\s|$)",
+                profile_heading_text,
+                re.IGNORECASE,
+            )
+        )
+        and any(
+            _xvideos_profile_url_matches(
+                urljoin(response.url, node.get("href", "")),
+                marker_username,
+            )
+            for node in soup.find_all("a", href=True)
+        )
+    )
+
+    if (
+        status_code == 200
+        and final_url_matches
+        and conflicting_profile_markers
+    ):
+        return (
+            UNKNOWN,
+            None,
+            "XVideos profile markers identify another username"
+        )
+
+    if (
+        status_code == 200
+        and final_url_matches
+        and title_matches
+        and profile_title is not None
+        and heading_matches
+        and exact_profile_link
+    ):
+        return (
+            FOUND,
+            profile_url,
+            "public XVideos profile found; identity not verified"
+        )
+
+    if 200 <= status_code < 300 and final_url_matches:
+        return (
+            POSSIBLE,
+            profile_url,
+            "incomplete XVideos profile evidence"
+        )
+
+    return (
+        UNKNOWN,
+        None,
+        "unrecognized XVideos response"
+    )
+
+
+# ============================================================
 # SPRAWDZANIE JEDNEGO SERWISU
 # ============================================================
 
@@ -441,6 +680,22 @@ def check_username_on_site(username, site_name, site_config):
         status_code = response.status_code
         content = response.text.lower()
         final_url = response.url.lower()
+
+        # XVideos wymaga potwierdzenia markerow takze dla HTTP 404,
+        # dlatego checker dziala przed generyczna klasyfikacja HTTP.
+        if checker == "xvideos_profile":
+            status, link, info = classify_xvideos_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return (
+                site_name,
+                status,
+                link,
+                info,
+            )
 
         # ----------------------------------------------------
         # RATE LIMIT
