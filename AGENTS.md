@@ -162,6 +162,54 @@ Raportuj krótko:
 3. Jaki jest wynik.
 4. Czy jest coś do kontroli.
 
+## Pamięć projektu i checkpointy
+Codex prowadzi równolegle dwa poziomy pamięci projektu.
+
+### Lokalne notatki operacyjne: `.codex/`
+- Przechowuj tam prywatne notatki operacyjne Codexa, bieżący kontekst, obserwacje techniczne i tymczasowe notatki pomocnicze.
+- `.codex/` pozostaje w `.gitignore` i nie jest częścią publicznego repozytorium.
+- Nie zapisuj tam sekretów, tokenów, haseł ani danych uwierzytelniających.
+
+### Oficjalna pamięć projektu
+Folder:
+`/home/martino/Programy/codex-memory/Refaktor_Lyr/`
+
+- Przechowuj tam oficjalne checkpointy umożliwiające późniejsze wznowienie pracy.
+- Zapisuj najważniejsze decyzje techniczne, wykonane zmiany, aktualny stan, problemy do dalszej kontroli oraz następny logiczny krok.
+- Folder znajduje się poza repozytorium.
+- Nie wykonuj `git add`, `git commit` ani `git push` dla plików z tego folderu.
+
+### Zasady checkpointów
+- Twórz jeden plik checkpointu na jeden dzień.
+- Używaj nazwy `CHECKPOINT_YYYY-MM-DD.txt`.
+- Jeśli tego samego dnia wykonywane są kolejne zadania, najpierw przeczytaj istniejący checkpoint, a następnie dopisz nowe informacje do tego samego pliku.
+- Nie twórz dla kolejnych zadań wariantów `_1`, `_2`, `_3`.
+- Nie nadpisuj wcześniejszych informacji bez potrzeby.
+- Na początku pliku, po dacie, wpisz krótki temat dnia.
+- Checkpoint musi wystarczać do wznowienia projektu bez odtwarzania całej historii rozmowy.
+
+Checkpoint powinien krótko zawierać:
+- stan branchu i repozytorium,
+- co zostało wykonane,
+- jakie pliki zmieniono,
+- ważne decyzje i reguły,
+- wyniki testów,
+- znane problemy i ograniczenia,
+- co pozostało do zrobienia,
+- następny zalecany krok.
+
+Codex może samodzielnie aktualizować `.codex/` oraz oficjalny folder pamięci projektu bez pytania o zgodę, o ile nie usuwa istniejących danych.
+
+Po zakończeniu większego etapu pracy automatycznie zaktualizuj checkpoint.
+
+### Folder wymiany plików i materiałów
+Folder:
+`/home/martino/Pobrane/Codex-pliki/`
+
+- Jest to standardowy folder downloadów Codexa, plików przekazywanych Codexowi przez użytkownika oraz screenshotów.
+- Materiałów wejściowych, plików roboczych i przygotowanych wyników szukaj w pierwszej kolejności w tym folderze, jeśli zadanie wskazuje na przekazany plik, pobrany materiał albo screenshot.
+- Przed zmianą, przeniesieniem lub usunięciem materiału potwierdź dokładny plik docelowy i zachowaj pozostałą zawartość folderu.
+
 ## .codex
 - Folder `.codex/` jest lokalnym miejscem roboczym Codexa.
 - Codex może tam przechowywać prywatne notatki, kontekst projektu i pomocnicze informacje operacyjne.
