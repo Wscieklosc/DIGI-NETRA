@@ -761,6 +761,258 @@ def classify_fansly_profile_response(username, response):
 
 
 # ============================================================
+# SPECJALNA DETEKCJA PUBLICZNYCH PROFILI PORNHUB
+# ============================================================
+
+def _pornhub_url_matches(value, expected_path):
+    if not value:
+        return False
+
+    parsed = urlparse(value)
+
+    return (
+        parsed.scheme == "https"
+        and parsed.netloc.casefold()
+        in ("pornhub.com", "www.pornhub.com")
+        and unquote(parsed.path).rstrip("/").casefold()
+        == expected_path.rstrip("/").casefold()
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
+def _pornhub_name_matches_slug(value, username):
+    if not value:
+        return False
+
+    normalized_name = re.sub(
+        r"[^a-z0-9]+",
+        "-",
+        value.casefold(),
+    ).strip("-")
+
+    return normalized_name == username.casefold()
+
+
+def classify_pornhub_profile_response(username, response, profile_url):
+    status_code = response.status_code
+    profile_path = f"/pornstar/{username}"
+
+    if status_code == 429:
+        return (
+            RATE_LIMIT,
+            None,
+            "HTTP 429"
+        )
+
+    if status_code in (401, 403):
+        return (
+            BLOCKED,
+            None,
+            f"HTTP {status_code}"
+        )
+
+    if status_code >= 500:
+        return (
+            ERROR,
+            None,
+            f"HTTP {status_code}"
+        )
+
+    final_url_lower = response.url.casefold()
+    block_url_markers = (
+        "/login",
+        "/signin",
+        "/challenge",
+        "/captcha",
+    )
+
+    if any(
+        marker in final_url_lower
+        for marker in block_url_markers
+    ):
+        return (
+            BLOCKED,
+            None,
+            "Pornhub login or challenge redirect"
+        )
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = (
+        " ".join(soup.title.get_text(" ", strip=True).split())
+        if soup.title
+        else ""
+    )
+    title_lower = title.casefold()
+    blocked_title_markers = (
+        "access denied",
+        "captcha",
+        "challenge",
+        "just a moment",
+        "log in",
+        "sign in",
+    )
+
+    if any(
+        marker in title_lower
+        for marker in blocked_title_markers
+    ):
+        return (
+            BLOCKED,
+            None,
+            "Pornhub access challenge"
+        )
+
+    canonical = soup.find("link", rel="canonical")
+    canonical_url = (
+        canonical.get("href", "")
+        if canonical
+        else ""
+    )
+    final_url_matches = _pornhub_url_matches(
+        response.url,
+        profile_path,
+    )
+    canonical_matches = _pornhub_url_matches(
+        canonical_url,
+        profile_path,
+    )
+
+    profile_header = soup.select_one("section.topProfileHeader")
+    profile_heading = (
+        profile_header.find("h1", attrs={"itemprop": "name"})
+        if profile_header
+        else None
+    )
+    profile_name = (
+        " ".join(
+            profile_heading.get_text(" ", strip=True).split()
+        )
+        if profile_heading
+        else ""
+    )
+    profile_name_matches = _pornhub_name_matches_slug(
+        profile_name,
+        username,
+    )
+
+    title_is_profile = (
+        bool(profile_name)
+        and title_lower.startswith(
+            f"{profile_name.casefold()} porn"
+        )
+        and "video" in title_lower
+        and title_lower.endswith("| pornhub")
+    )
+    verified_marker = (
+        profile_header.find(
+            attrs={
+                "data-title": lambda value: (
+                    value
+                    and value.casefold()
+                    in ("verified model", "verified pornstar")
+                )
+            }
+        )
+        if profile_header
+        else None
+    )
+    exact_profile_link = any(
+        _pornhub_url_matches(
+            urljoin(response.url, node.get("href", "")),
+            profile_path,
+        )
+        for node in soup.select("#mainMenuProfile a[href]")
+    )
+
+    response_history = getattr(response, "history", [])
+    if not isinstance(response_history, (list, tuple)):
+        response_history = []
+
+    redirected_from_profile = any(
+        history_item.status_code in (301, 302, 303, 307, 308)
+        and _pornhub_url_matches(
+            history_item.url,
+            profile_path,
+        )
+        for history_item in response_history
+    )
+    final_url_is_catalog = _pornhub_url_matches(
+        response.url,
+        "/pornstars",
+    )
+    canonical_is_catalog = _pornhub_url_matches(
+        canonical_url,
+        "/pornstars",
+    )
+    requested_profile_markers = (
+        canonical_matches
+        or profile_name_matches
+        or exact_profile_link
+    )
+
+    if (
+        status_code == 200
+        and redirected_from_profile
+        and final_url_is_catalog
+        and canonical_is_catalog
+        and not requested_profile_markers
+    ):
+        return (
+            NOT_FOUND,
+            None,
+            "no public Pornhub profile at this path"
+        )
+
+    if status_code >= 400:
+        return (
+            UNKNOWN,
+            None,
+            f"HTTP {status_code}"
+        )
+
+    if status_code != 200 or not final_url_matches:
+        return (
+            UNKNOWN,
+            None,
+            "unexpected Pornhub final URL"
+        )
+
+    if canonical_url and not canonical_matches:
+        return (
+            UNKNOWN,
+            None,
+            "Pornhub canonical does not match the profile"
+        )
+
+    if profile_name and not profile_name_matches:
+        return (
+            UNKNOWN,
+            None,
+            "Pornhub profile name conflicts with the username"
+        )
+
+    if (
+        canonical_matches
+        and title_is_profile
+        and profile_name_matches
+        and verified_marker is not None
+        and exact_profile_link
+    ):
+        return (
+            FOUND,
+            profile_url,
+            "public Pornhub profile found; identity not verified"
+        )
+
+    return (
+        POSSIBLE,
+        profile_url,
+        "incomplete Pornhub profile evidence"
+    )
+
+
+# ============================================================
 # SPRAWDZANIE JEDNEGO SERWISU
 # ============================================================
 
@@ -851,6 +1103,20 @@ def check_username_on_site(username, site_name, site_config):
             status, link, info = classify_fansly_profile_response(
                 username,
                 response,
+            )
+
+            return (
+                site_name,
+                status,
+                link,
+                info,
+            )
+
+        if checker == "pornhub_profile":
+            status, link, info = classify_pornhub_profile_response(
+                username,
+                response,
+                url,
             )
 
             return (

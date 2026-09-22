@@ -634,5 +634,178 @@ class FanslyProfileDetectionTests(unittest.TestCase):
         self.assertEqual(result[1], BLOCKED)
 
 
+class PornhubProfileDetectionTests(unittest.TestCase):
+    def setUp(self):
+        self.site_name = "Pornhub"
+        self.site_config = {
+            "url": "https://www.pornhub.com/pornstar/{username}",
+            "checker": "pornhub_profile",
+            "category": "adult",
+            "sensitive": True,
+            "rate_limit_delay": 0,
+        }
+
+    def response(
+        self,
+        status_code,
+        text="",
+        url=None,
+        history=None,
+    ):
+        response = Mock()
+        response.status_code = status_code
+        response.text = text
+        response.url = (
+            url
+            or "https://www.pornhub.com/pornstar/test-user"
+        )
+        response.history = history or []
+        return response
+
+    def check(self, response, username="test-user"):
+        with (
+            patch(
+                "main.username.requests.request",
+                return_value=response,
+            ),
+            patch("main.username.time.sleep"),
+        ):
+            return check_username_on_site(
+                username,
+                self.site_name,
+                self.site_config,
+            )
+
+    def profile_html(
+        self,
+        slug="test-user",
+        profile_name="Test User",
+        canonical_slug=None,
+        link_slug=None,
+    ):
+        canonical_slug = canonical_slug or slug
+        link_slug = link_slug or slug
+
+        return f"""
+            <html>
+                <head>
+                    <title>
+                        {profile_name} Porn Videos -
+                        Verified Pornstar Profile | Pornhub
+                    </title>
+                    <link
+                        rel="canonical"
+                        href="https://www.pornhub.com/pornstar/{canonical_slug}"
+                    >
+                </head>
+                <body>
+                    <section class="topProfileHeader">
+                        <h1 itemprop="name">{profile_name}</h1>
+                        <span
+                            class="verified-icon"
+                            data-title="Verified Model"
+                        ></span>
+                    </section>
+                    <nav id="mainMenuProfile">
+                        <a href="/pornstar/{link_slug}">Home</a>
+                    </nav>
+                </body>
+            </html>
+        """
+
+    def test_pornhub_complete_public_profile_is_found(self):
+        result = self.check(
+            self.response(200, text=self.profile_html())
+        )
+
+        self.assertEqual(result[1], FOUND)
+        self.assertEqual(
+            result[3],
+            "public Pornhub profile found; identity not verified",
+        )
+
+    def test_pornhub_bare_200_does_not_return_found(self):
+        result = self.check(
+            self.response(200, text="<html></html>")
+        )
+
+        self.assertNotEqual(result[1], FOUND)
+
+    def test_pornhub_wrong_final_url_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.profile_html(),
+                url="https://www.pornhub.com/pornstar/other-user",
+            )
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_pornhub_wrong_canonical_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.profile_html(
+                    canonical_slug="other-user",
+                ),
+            )
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_pornhub_mismatched_username_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.profile_html(
+                    profile_name="Other User",
+                    link_slug="other-user",
+                ),
+            )
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_pornhub_catalog_redirect_is_not_found(self):
+        redirect = Mock()
+        redirect.status_code = 301
+        redirect.url = (
+            "https://www.pornhub.com/pornstar/test-user"
+        )
+        catalog_html = """
+            <html>
+                <head>
+                    <title>Top Pornstars | Pornhub</title>
+                    <link
+                        rel="canonical"
+                        href="https://www.pornhub.com/pornstars"
+                    >
+                </head>
+            </html>
+        """
+        result = self.check(
+            self.response(
+                200,
+                text=catalog_html,
+                url="https://www.pornhub.com/pornstars",
+                history=[redirect],
+            )
+        )
+
+        self.assertEqual(result[1], NOT_FOUND)
+        self.assertIn("at this path", result[3])
+
+    def test_pornhub_403_is_blocked(self):
+        result = self.check(self.response(403))
+
+        self.assertEqual(result[1], BLOCKED)
+
+    def test_pornhub_429_is_rate_limited(self):
+        result = self.check(self.response(429))
+
+        self.assertEqual(result[1], RATE_LIMIT)
+
+
 if __name__ == "__main__":
     unittest.main()
