@@ -611,6 +611,156 @@ def classify_xvideos_profile_response(username, response, profile_url):
 
 
 # ============================================================
+# SPECJALNA DETEKCJA PUBLICZNYCH PROFILI FANSLY
+# ============================================================
+
+def classify_fansly_profile_response(username, response):
+    status_code = response.status_code
+
+    if status_code == 429:
+        return (
+            RATE_LIMIT,
+            None,
+            "HTTP 429"
+        )
+
+    if status_code in (401, 403):
+        return (
+            BLOCKED,
+            None,
+            f"HTTP {status_code}"
+        )
+
+    if status_code >= 500:
+        return (
+            ERROR,
+            None,
+            f"HTTP {status_code}"
+        )
+
+    final_url = response.url.casefold()
+    block_url_markers = (
+        "/login",
+        "/signin",
+        "/challenge",
+        "/captcha",
+    )
+
+    if any(
+        marker in final_url
+        for marker in block_url_markers
+    ):
+        return (
+            BLOCKED,
+            None,
+            "Fansly login or challenge redirect"
+        )
+
+    try:
+        payload = response.json()
+    except (TypeError, ValueError):
+        content = response.text.casefold()
+        block_content_markers = (
+            "captcha",
+            "challenge",
+            "access denied",
+            "log in",
+            "sign in",
+        )
+
+        if any(
+            marker in content
+            for marker in block_content_markers
+        ):
+            return (
+                BLOCKED,
+                None,
+                "Fansly access challenge"
+            )
+
+        return (
+            UNKNOWN,
+            None,
+            "Fansly response is not valid JSON"
+        )
+
+    if status_code >= 400:
+        return (
+            UNKNOWN,
+            None,
+            f"HTTP {status_code}"
+        )
+
+    if status_code != 200 or not isinstance(payload, dict):
+        return (
+            UNKNOWN,
+            None,
+            "unrecognized Fansly response"
+        )
+
+    if payload.get("success") is not True:
+        return (
+            UNKNOWN,
+            None,
+            "Fansly lookup was not successful"
+        )
+
+    accounts = payload.get("response")
+
+    if not isinstance(accounts, list):
+        return (
+            UNKNOWN,
+            None,
+            "Fansly account list is missing"
+        )
+
+    if not accounts:
+        return (
+            NOT_FOUND,
+            None,
+            "no public Fansly profile in this lookup"
+        )
+
+    if len(accounts) != 1 or not isinstance(accounts[0], dict):
+        return (
+            UNKNOWN,
+            None,
+            "unexpected Fansly account data"
+        )
+
+    account = accounts[0]
+    account_username = account.get("username")
+    account_id = account.get("id")
+    valid_account_id = (
+        isinstance(account_id, (str, int))
+        and not isinstance(account_id, bool)
+        and bool(str(account_id).strip())
+    )
+
+    if (
+        isinstance(account_username, str)
+        and account_username.casefold() == username.casefold()
+        and valid_account_id
+    ):
+        public_profile_url = (
+            "https://fansly.com/"
+            f"{quote(username, safe='')}"
+        )
+
+        return (
+            FOUND,
+            public_profile_url,
+            "public Fansly profile found; identity not verified"
+        )
+
+    return (
+        UNKNOWN,
+        None,
+        "incomplete or mismatched Fansly account data"
+    )
+
+
+# ============================================================
 # SPRAWDZANIE JEDNEGO SERWISU
 # ============================================================
 
@@ -688,6 +838,19 @@ def check_username_on_site(username, site_name, site_config):
                 username,
                 response,
                 url,
+            )
+
+            return (
+                site_name,
+                status,
+                link,
+                info,
+            )
+
+        if checker == "fansly_profile":
+            status, link, info = classify_fansly_profile_response(
+                username,
+                response,
             )
 
             return (

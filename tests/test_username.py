@@ -515,5 +515,124 @@ class XVideosProfileDetectionTests(unittest.TestCase):
         self.assertEqual(result[1], RATE_LIMIT)
 
 
+class FanslyProfileDetectionTests(unittest.TestCase):
+    def setUp(self):
+        self.site_name = "Fansly"
+        self.site_config = {
+            "url": (
+                "https://apiv3.fansly.com/api/v1/account"
+                "?usernames={username}"
+            ),
+            "checker": "fansly_profile",
+            "category": "adult",
+            "sensitive": True,
+            "rate_limit_delay": 0,
+        }
+
+    def response(self, status_code, payload=None, url=None):
+        response = Mock()
+        response.status_code = status_code
+        response.text = json.dumps(payload) if payload is not None else ""
+        response.url = (
+            url
+            or "https://apiv3.fansly.com/api/v1/account"
+            "?usernames=test_user"
+        )
+        response.json.return_value = payload
+        return response
+
+    def check(self, response, username="test_user"):
+        with (
+            patch(
+                "main.username.requests.request",
+                return_value=response,
+            ),
+            patch("main.username.time.sleep"),
+        ):
+            return check_username_on_site(
+                username,
+                self.site_name,
+                self.site_config,
+            )
+
+    def test_fansly_complete_public_profile_is_found(self):
+        result = self.check(
+            self.response(
+                200,
+                {
+                    "success": True,
+                    "response": [
+                        {
+                            "id": "225046783078694912",
+                            "username": "test_user",
+                        }
+                    ],
+                },
+            )
+        )
+
+        self.assertEqual(result[1], FOUND)
+        self.assertIn("identity not verified", result[3])
+
+    def test_fansly_empty_result_is_not_found(self):
+        result = self.check(
+            self.response(
+                200,
+                {"success": True, "response": []},
+            )
+        )
+
+        self.assertEqual(result[1], NOT_FOUND)
+        self.assertIn("in this lookup", result[3])
+
+    def test_fansly_mismatched_username_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                {
+                    "success": True,
+                    "response": [
+                        {
+                            "id": "225046783078694912",
+                            "username": "other_user",
+                        }
+                    ],
+                },
+            )
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_fansly_missing_account_id_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                {
+                    "success": True,
+                    "response": [{"username": "test_user"}],
+                },
+            )
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_fansly_incomplete_json_is_unknown(self):
+        result = self.check(
+            self.response(200, {"success": True})
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_fansly_429_is_rate_limited(self):
+        result = self.check(self.response(429))
+
+        self.assertEqual(result[1], RATE_LIMIT)
+
+    def test_fansly_403_is_blocked(self):
+        result = self.check(self.response(403))
+
+        self.assertEqual(result[1], BLOCKED)
+
+
 if __name__ == "__main__":
     unittest.main()
