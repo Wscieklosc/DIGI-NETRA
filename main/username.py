@@ -1,10 +1,12 @@
 import json
+import re
 import time
 import requests
 
+from bs4 import BeautifulSoup
 from rich import print
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlparse
 
 from .instaemailfind import instafind as infind
 from .scrap import chess
@@ -32,6 +34,151 @@ ERROR = "ERROR"
 def load_sites_config(path="main/murl.json"):
     with open(path, "r", encoding="utf-8") as file:
         return json.load(file)
+
+
+# ============================================================
+# SPECJALNA DETEKCJA PROFILI X
+# ============================================================
+
+def _x_profile_url_matches(value, username):
+    if not value:
+        return False
+
+    parsed = urlparse(value)
+
+    return (
+        parsed.scheme == "https"
+        and parsed.netloc.lower() in ("x.com", "www.x.com")
+        and unquote(parsed.path).strip("/").casefold()
+        == username.casefold()
+    )
+
+
+def classify_x_profile_response(username, response, profile_url):
+    if not re.fullmatch(r"[A-Za-z0-9_]{1,15}", username):
+        return (
+            NOT_FOUND,
+            None,
+            "invalid X username format"
+        )
+
+    soup = BeautifulSoup(response.text, "html.parser")
+
+    title = (
+        soup.title.get_text(" ", strip=True)
+        if soup.title
+        else ""
+    )
+
+    canonical_node = soup.find(
+        "link",
+        rel=lambda value: value and "canonical" in value,
+    )
+    canonical_url = (
+        canonical_node.get("href", "")
+        if canonical_node
+        else ""
+    )
+
+    og_url_node = soup.find(
+        "meta",
+        attrs={"property": "og:url"},
+    )
+    og_url = (
+        og_url_node.get("content", "")
+        if og_url_node
+        else ""
+    )
+
+    og_title_node = soup.find(
+        "meta",
+        attrs={"property": "og:title"},
+    )
+    og_title = (
+        og_title_node.get("content", "")
+        if og_title_node
+        else ""
+    )
+
+    final_url_matches = _x_profile_url_matches(
+        response.url,
+        username,
+    )
+    canonical_matches = _x_profile_url_matches(
+        canonical_url,
+        username,
+    )
+    og_url_matches = _x_profile_url_matches(
+        og_url,
+        username,
+    )
+
+    handle_pattern = re.compile(
+        rf"\(@{re.escape(username)}\)\s*(?:/|on)\s*X(?:\s|$)",
+        re.IGNORECASE,
+    )
+    title_matches = bool(handle_pattern.search(title))
+    og_title_matches = bool(handle_pattern.search(og_title))
+
+    not_found_title = "user profile not found" in title.casefold()
+    not_found_og_title = (
+        "user profile not found" in og_title.casefold()
+    )
+
+    if (
+        not_found_title
+        and not_found_og_title
+        and not canonical_matches
+        and not og_url_matches
+    ):
+        return (
+            NOT_FOUND,
+            None,
+            "X not-found metadata"
+        )
+
+    login_titles = (
+        "log in / x",
+        "log in to x / x",
+        "sign up for x",
+    )
+
+    if (
+        title.casefold() in login_titles
+        and not canonical_matches
+        and not og_url_matches
+    ):
+        return (
+            BLOCKED,
+            None,
+            "X login page"
+        )
+
+    if (
+        response.status_code == 200
+        and final_url_matches
+        and canonical_matches
+        and og_url_matches
+        and (title_matches or og_title_matches)
+    ):
+        return (
+            FOUND,
+            profile_url,
+            "X profile metadata confirmed"
+        )
+
+    if 200 <= response.status_code < 300 and final_url_matches:
+        return (
+            POSSIBLE,
+            profile_url,
+            "incomplete X profile metadata"
+        )
+
+    return (
+        UNKNOWN,
+        None,
+        "unrecognized X response"
+    )
 
 
 # ============================================================
@@ -84,6 +231,11 @@ def check_username_on_site(username, site_name, site_config):
     confidence_score = site_config.get(
         "confidence_score",
         0
+    )
+
+    checker = site_config.get(
+        "checker",
+        ""
     )
 
     try:
@@ -180,6 +332,24 @@ def check_username_on_site(username, site_name, site_config):
                 UNKNOWN,
                 None,
                 f"HTTP {status_code}"
+            )
+
+        # ----------------------------------------------------
+        # SPECJALNY CHECKER X
+        # ----------------------------------------------------
+
+        if checker == "x_profile":
+            status, link, info = classify_x_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return (
+                site_name,
+                status,
+                link,
+                info,
             )
 
         # ----------------------------------------------------

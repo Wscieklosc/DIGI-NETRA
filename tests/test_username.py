@@ -107,5 +107,125 @@ class CheckUsernameOnSiteTests(unittest.TestCase):
         self.assertEqual(result[1], BLOCKED)
 
 
+class XProfileDetectionTests(unittest.TestCase):
+    def setUp(self):
+        self.site_name = "Twitter"
+        self.site_config = {
+            "url": "https://x.com/{username}",
+            "checker": "x_profile",
+            "needs_login": True,
+            "rate_limit_delay": 0,
+        }
+
+    def response(self, status_code, text="", url=None):
+        response = Mock()
+        response.status_code = status_code
+        response.text = text
+        response.url = url or "https://x.com/test_user"
+        return response
+
+    def check(self, response):
+        with (
+            patch(
+                "main.username.requests.request",
+                return_value=response,
+            ),
+            patch("main.username.time.sleep"),
+        ):
+            return check_username_on_site(
+                "test_user",
+                self.site_name,
+                self.site_config,
+            )
+
+    def x_profile_html(self, username="test_user"):
+        profile_url = f"https://x.com/{username}"
+
+        return f"""
+            <html>
+                <head>
+                    <title>Test User (@{username}) / X</title>
+                    <link rel="canonical" href="{profile_url}">
+                    <meta property="og:url" content="{profile_url}">
+                    <meta
+                        property="og:title"
+                        content="Test User (@{username}) on X"
+                    >
+                </head>
+            </html>
+        """
+
+    def test_x_profile_requires_matching_metadata_for_found(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.x_profile_html(),
+            )
+        )
+
+        self.assertEqual(result[1], FOUND)
+
+    def test_x_bare_200_remains_possible(self):
+        result = self.check(self.response(200, text="<html></html>"))
+
+        self.assertEqual(result[1], POSSIBLE)
+
+    def test_x_mismatched_profile_metadata_remains_possible(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.x_profile_html("another_user"),
+            )
+        )
+
+        self.assertEqual(result[1], POSSIBLE)
+
+    def test_x_not_found_metadata_is_not_found(self):
+        html = """
+            <html>
+                <head>
+                    <title>User Profile Not Found - X | 404 Error</title>
+                    <meta
+                        property="og:title"
+                        content="User Profile Not Found - X | 404 Error"
+                    >
+                </head>
+            </html>
+        """
+
+        result = self.check(self.response(200, text=html))
+
+        self.assertEqual(result[1], NOT_FOUND)
+
+    def test_x_login_page_is_blocked(self):
+        result = self.check(
+            self.response(
+                200,
+                text="<html><title>Log in / X</title></html>",
+            )
+        )
+
+        self.assertEqual(result[1], BLOCKED)
+
+    def test_x_unicode_username_is_not_found(self):
+        with (
+            patch(
+                "main.username.requests.request",
+                return_value=self.response(
+                    200,
+                    url="https://x.com/za%C5%BC%C3%B3%C5%82%C4%87",
+                ),
+            ),
+            patch("main.username.time.sleep"),
+        ):
+            result = check_username_on_site(
+                "zażółć",
+                self.site_name,
+                self.site_config,
+            )
+
+        self.assertEqual(result[1], NOT_FOUND)
+
+
 if __name__ == "__main__":
     unittest.main()
