@@ -36,8 +36,9 @@
   },
   "GitHub": {
     "url": "https://github.com/{username}",
+    "checker": "github_profile",
     "detect_based_on_message": false,
-    "not_found_status_codes": [406],
+    "not_found_status_codes": [404],
     "not_found_message": "",
     "found_message": "",
     "request_method": "GET",
@@ -54,6 +55,7 @@
   },
   "Instagram": {
     "url": "https://www.instagram.com/{username}",
+    "checker": "instagram_profile",
     "detect_based_on_message": false,
     "not_found_status_codes": [404],
     "not_found_message": "",

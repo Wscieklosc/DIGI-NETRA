@@ -2578,6 +2578,552 @@ def classify_facebook_profile_response(username, response, profile_url):
 
 
 # ============================================================
+# SPECJALNA DETEKCJA PROFILI GITHUB
+# ============================================================
+
+def _github_profile_url_matches(value, username):
+    if not isinstance(value, str) or not value:
+        return False
+
+    parsed = urlparse(value)
+
+    return (
+        parsed.scheme in ("http", "https")
+        and parsed.netloc.casefold() in ("github.com", "www.github.com")
+        and unquote(parsed.path).strip("/").casefold()
+        == username.casefold()
+    )
+
+
+def _github_avatar_user_id(value):
+    if not isinstance(value, str):
+        return None
+
+    parsed = urlparse(value)
+
+    if parsed.netloc.casefold() not in (
+        "avatars.githubusercontent.com",
+        "avatars.github.com",
+    ):
+        return None
+
+    match = re.fullmatch(r"/u/(\d+)", parsed.path.rstrip("/"))
+
+    return match.group(1) if match else None
+
+
+def classify_github_profile_response(username, response, profile_url):
+    status_code = response.status_code
+    final_url = response.url or ""
+    parsed_final_url = urlparse(final_url)
+    final_path = unquote(parsed_final_url.path).casefold()
+
+    if any(
+        marker in final_path
+        for marker in ("/login", "/sessions", "/challenge", "/captcha")
+    ):
+        return (
+            BLOCKED,
+            None,
+            "GitHub login or challenge redirect"
+        )
+
+    if status_code == 429:
+        return (
+            RATE_LIMIT,
+            None,
+            "HTTP 429"
+        )
+
+    if status_code in (401, 403):
+        return (
+            BLOCKED,
+            None,
+            f"HTTP {status_code}"
+        )
+
+    if status_code >= 500:
+        return (
+            ERROR,
+            None,
+            f"HTTP {status_code}"
+        )
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = (
+        soup.title.get_text(" ", strip=True)
+        if soup.title
+        else ""
+    )
+
+    def meta_content(attribute, value):
+        node = soup.find("meta", attrs={attribute: value})
+        return node.get("content", "") if node else ""
+
+    canonical_node = soup.find(
+        "link",
+        rel=lambda value: value and "canonical" in value,
+    )
+    canonical_url = (
+        canonical_node.get("href", "")
+        if canonical_node
+        else ""
+    )
+    og_url = meta_content("property", "og:url")
+    og_type = meta_content("property", "og:type")
+    og_title = meta_content("property", "og:title")
+    og_image = meta_content("property", "og:image")
+    profile_username = meta_content("property", "profile:username")
+    metadata_login = meta_content(
+        "name",
+        "octolytics-dimension-user_login",
+    )
+    metadata_user_id = meta_content(
+        "name",
+        "octolytics-dimension-user_id",
+    )
+
+    expected_username = username.casefold()
+    final_url_matches = _github_profile_url_matches(final_url, username)
+    canonical_matches = _github_profile_url_matches(
+        canonical_url,
+        username,
+    )
+    og_url_matches = _github_profile_url_matches(og_url, username)
+
+    final_url_conflict = bool(
+        parsed_final_url.netloc.casefold()
+        in ("github.com", "www.github.com")
+        and unquote(parsed_final_url.path).strip("/")
+        and not final_url_matches
+    )
+    canonical_conflict = bool(canonical_url and not canonical_matches)
+    og_url_conflict = bool(og_url and not og_url_matches)
+
+    public_usernames = {
+        value.casefold()
+        for value in (profile_username, metadata_login)
+        if value
+    }
+    username_conflict = bool(
+        public_usernames
+        and public_usernames != {expected_username}
+    )
+
+    avatar_user_id = _github_avatar_user_id(og_image)
+    stable_user_ids = {
+        value
+        for value in (metadata_user_id, avatar_user_id)
+        if value
+    }
+    stable_id_conflict = (
+        len(stable_user_ids) > 1
+        or bool(metadata_user_id and not metadata_user_id.isdigit())
+    )
+
+    profile_schema = soup.find(
+        attrs={
+            "itemtype": re.compile(
+                r"^https?://schema\.org/(?:Person|Organization)$"
+            )
+        }
+    )
+    profile_marker_present = bool(profile_schema)
+    profile_evidence_present = any((
+        canonical_url,
+        og_url,
+        profile_username,
+        metadata_login,
+        metadata_user_id,
+        avatar_user_id,
+        profile_marker_present,
+    ))
+
+    if (
+        final_url_conflict
+        or canonical_conflict
+        or og_url_conflict
+        or username_conflict
+        or stable_id_conflict
+    ):
+        return (
+            UNKNOWN,
+            None,
+            "GitHub profile evidence conflict"
+        )
+
+    not_found_marker = (
+        response.text.strip().casefold() == "not found"
+        or "page not found" in title.casefold()
+        or title.casefold() == "404 · github"
+    )
+
+    if (
+        status_code == 404
+        and final_url_matches
+        and not_found_marker
+        and not profile_evidence_present
+        and og_type.casefold() != "profile"
+    ):
+        return (
+            NOT_FOUND,
+            None,
+            "public GitHub profile not found at this username"
+        )
+
+    if status_code >= 400:
+        return (
+            UNKNOWN,
+            None,
+            f"unconfirmed GitHub HTTP {status_code} response"
+        )
+
+    if status_code != 200 or not final_url_matches:
+        return (
+            UNKNOWN,
+            None,
+            "unexpected GitHub final URL"
+        )
+
+    title_matches = (
+        title.casefold().startswith(expected_username)
+        and title.casefold().endswith("· github")
+    )
+    og_title_matches = bool(
+        og_title
+        and og_title.casefold().startswith(expected_username)
+    )
+    username_matches = (
+        profile_username.casefold() == expected_username
+        and (
+            not metadata_login
+            or metadata_login.casefold() == expected_username
+        )
+    )
+    stable_id_present = bool(
+        avatar_user_id
+        and len(stable_user_ids) == 1
+    )
+
+    if (
+        canonical_matches
+        and og_url_matches
+        and og_type.casefold() == "profile"
+        and title_matches
+        and og_title_matches
+        and username_matches
+        and profile_marker_present
+        and stable_id_present
+    ):
+        return (
+            FOUND,
+            profile_url,
+            "public GitHub profile found; identity not verified"
+        )
+
+    return (
+        POSSIBLE,
+        profile_url,
+        "incomplete GitHub public profile evidence"
+    )
+
+
+# ============================================================
+# SPECJALNA DETEKCJA PROFILI INSTAGRAM
+# ============================================================
+
+def _instagram_profile_url_matches(value, username):
+    if not isinstance(value, str) or not value:
+        return False
+
+    parsed = urlparse(value)
+
+    return (
+        parsed.scheme in ("http", "https")
+        and parsed.netloc.casefold()
+        in ("instagram.com", "www.instagram.com")
+        and unquote(parsed.path).strip("/").casefold()
+        == username.casefold()
+    )
+
+
+def _instagram_ios_username(value):
+    if not isinstance(value, str):
+        return None
+
+    match = re.fullmatch(
+        r"instagram://user\?username=([^&]+)",
+        value.strip(),
+        re.IGNORECASE,
+    )
+
+    return unquote(match.group(1)).casefold() if match else None
+
+
+def _instagram_android_username(value):
+    if not isinstance(value, str) or not value:
+        return None
+
+    parsed = urlparse(value)
+
+    if parsed.netloc.casefold() not in (
+        "instagram.com",
+        "www.instagram.com",
+    ):
+        return None
+
+    path_parts = [
+        part
+        for part in unquote(parsed.path).split("/")
+        if part
+    ]
+
+    if len(path_parts) == 2 and path_parts[0].casefold() == "_u":
+        return path_parts[1].casefold()
+
+    return None
+
+
+def classify_instagram_profile_response(username, response, profile_url):
+    status_code = response.status_code
+    final_url = response.url or ""
+    parsed_final_url = urlparse(final_url)
+    final_path = unquote(parsed_final_url.path).casefold()
+
+    blocked_paths = (
+        "/accounts/login",
+        "/challenge",
+        "/checkpoint",
+        "/captcha",
+    )
+
+    if any(marker in final_path for marker in blocked_paths):
+        return (
+            BLOCKED,
+            None,
+            "Instagram login or challenge redirect"
+        )
+
+    if status_code == 429:
+        return (
+            RATE_LIMIT,
+            None,
+            "HTTP 429"
+        )
+
+    if status_code in (401, 403):
+        return (
+            BLOCKED,
+            None,
+            f"HTTP {status_code}"
+        )
+
+    if status_code >= 500:
+        return (
+            ERROR,
+            None,
+            f"HTTP {status_code}"
+        )
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = (
+        soup.title.get_text(" ", strip=True)
+        if soup.title
+        else ""
+    )
+
+    def meta_content(property_name):
+        node = soup.find("meta", attrs={"property": property_name})
+        return node.get("content", "") if node else ""
+
+    canonical_node = soup.find(
+        "link",
+        rel=lambda value: value and "canonical" in value,
+    )
+    canonical_url = (
+        canonical_node.get("href", "")
+        if canonical_node
+        else ""
+    )
+    og_url = meta_content("og:url")
+    og_type = meta_content("og:type")
+    og_title = meta_content("og:title")
+    ios_url = meta_content("al:ios:url")
+    android_url = meta_content("al:android:url")
+
+    expected_username = username.casefold()
+    final_url_matches = _instagram_profile_url_matches(
+        final_url,
+        username,
+    )
+    canonical_matches = _instagram_profile_url_matches(
+        canonical_url,
+        username,
+    )
+    og_url_matches = _instagram_profile_url_matches(og_url, username)
+
+    final_username = (
+        unquote(parsed_final_url.path).strip("/").casefold()
+        if parsed_final_url.netloc.casefold()
+        in ("instagram.com", "www.instagram.com")
+        else None
+    )
+    final_url_conflict = bool(
+        final_username
+        and final_username != expected_username
+    )
+    canonical_conflict = bool(canonical_url and not canonical_matches)
+    og_url_conflict = bool(og_url and not og_url_matches)
+
+    ios_username = _instagram_ios_username(ios_url)
+    android_username = _instagram_android_username(android_url)
+    deep_link_usernames = {
+        value
+        for value in (ios_username, android_username)
+        if value
+    }
+
+    route_usernames = {
+        unquote(value).casefold()
+        for value in re.findall(
+            r'"params"\s*:\s*\{\s*"username"\s*:\s*"([^"]+)"',
+            response.text,
+        )
+    }
+    username_conflict = bool(
+        (deep_link_usernames and deep_link_usernames != {expected_username})
+        or (route_usernames and route_usernames != {expected_username})
+    )
+
+    props_profile_ids = set(re.findall(
+        r'PolarisProfilePostsTabRoot\.react"\s*\}\s*,'
+        r'\s*"props"\s*:\s*\{\s*"id"\s*:\s*"(\d+)"',
+        response.text,
+    ))
+    page_profile_ids = set(re.findall(
+        r'profilePage_(\d+)',
+        response.text,
+    ))
+    logging_profile_ids = set(re.findall(
+        r'"profile_id"\s*:\s*"(\d+)"',
+        response.text,
+    ))
+    stable_profile_ids = (
+        props_profile_ids
+        | page_profile_ids
+        | logging_profile_ids
+    )
+    stable_id_conflict = len(stable_profile_ids) > 1
+
+    profile_root_present = (
+        "PolarisLoggedOutDesktopWWWProfileRoot.react" in response.text
+        and "PolarisProfilePostsTabRoot.react" in response.text
+        and (
+            "comet.igweb.PolarisLoggedOutDesktopWWWProfileRoute"
+            in response.text
+        )
+    )
+    profile_json_complete = (
+        len(props_profile_ids) == 1
+        and props_profile_ids == page_profile_ids
+        and props_profile_ids == logging_profile_ids
+    )
+
+    handle_pattern = re.compile(
+        rf"\(@{re.escape(username)}\)\s*[•·]",
+        re.IGNORECASE,
+    )
+    title_matches = bool(handle_pattern.search(title))
+    og_title_matches = bool(handle_pattern.search(og_title))
+
+    clear_login_wall = (
+        title.casefold() in ("login • instagram", "log in • instagram")
+        and bool(soup.find("form", action=re.compile(r"/accounts/login")))
+        and not canonical_url
+        and not og_url
+    )
+
+    if clear_login_wall:
+        return (
+            BLOCKED,
+            None,
+            "Instagram login wall"
+        )
+
+    if (
+        final_url_conflict
+        or canonical_conflict
+        or og_url_conflict
+        or username_conflict
+        or stable_id_conflict
+    ):
+        return (
+            UNKNOWN,
+            None,
+            "Instagram profile evidence conflict"
+        )
+
+    if status_code >= 400:
+        return (
+            UNKNOWN,
+            None,
+            f"unconfirmed Instagram HTTP {status_code}; "
+            "account existence unknown"
+        )
+
+    if status_code != 200 or not final_url_matches:
+        return (
+            UNKNOWN,
+            None,
+            "unexpected Instagram final URL; account existence unknown"
+        )
+
+    if (
+        canonical_matches
+        and og_url_matches
+        and og_type.casefold() == "profile"
+        and title_matches
+        and og_title_matches
+        and route_usernames == {expected_username}
+        and profile_root_present
+        and profile_json_complete
+        and len(stable_profile_ids) == 1
+        and (
+            not deep_link_usernames
+            or deep_link_usernames == {expected_username}
+        )
+    ):
+        return (
+            FOUND,
+            profile_url,
+            "public Instagram profile found; identity not verified"
+        )
+
+    soft_not_found = (
+        title.casefold() == "instagram"
+        and not canonical_url
+        and not og_url
+        and not route_usernames
+        and not stable_profile_ids
+        and not profile_root_present
+    )
+
+    if soft_not_found:
+        return (
+            UNKNOWN,
+            None,
+            "Instagram public profile not confirmed; "
+            "account existence unknown"
+        )
+
+    return (
+        POSSIBLE,
+        profile_url,
+        "incomplete Instagram public profile evidence"
+    )
+
+
+# ============================================================
 # SPRAWDZANIE JEDNEGO SERWISU
 # ============================================================
 
@@ -2749,6 +3295,34 @@ def check_username_on_site(username, site_name, site_config):
 
         if checker == "facebook_profile":
             status, link, info = classify_facebook_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return (
+                site_name,
+                status,
+                link,
+                info,
+            )
+
+        if checker == "github_profile":
+            status, link, info = classify_github_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return (
+                site_name,
+                status,
+                link,
+                info,
+            )
+
+        if checker == "instagram_profile":
+            status, link, info = classify_instagram_profile_response(
                 username,
                 response,
                 url,

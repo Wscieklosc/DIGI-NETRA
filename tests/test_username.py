@@ -1962,5 +1962,366 @@ class FacebookProfileDetectionTests(unittest.TestCase):
         self.assertEqual(config["checker"], "facebook_profile")
 
 
+class GitHubProfileDetectionTests(unittest.TestCase):
+    def setUp(self):
+        self.site_name = "GitHub"
+        self.username = "TestUser"
+        self.user_id = "123456789"
+        self.site_config = {
+            "url": "https://github.com/{username}",
+            "checker": "github_profile",
+            "rate_limit_delay": 0,
+        }
+
+    def response(self, status_code, text="", url=None):
+        response = Mock()
+        response.status_code = status_code
+        response.text = text
+        response.url = url or f"https://github.com/{self.username}"
+        return response
+
+    def check(self, response):
+        with (
+            patch(
+                "main.username.requests.request",
+                return_value=response,
+            ),
+            patch("main.username.time.sleep"),
+        ):
+            return check_username_on_site(
+                self.username,
+                self.site_name,
+                self.site_config,
+            )
+
+    def profile_html(
+        self,
+        *,
+        canonical_username=None,
+        og_username=None,
+        metadata_username=None,
+        metadata_user_id=None,
+        avatar_user_id=None,
+        include_profile_marker=True,
+    ):
+        canonical_username = canonical_username or self.username
+        og_username = og_username or self.username
+        metadata_username = metadata_username or self.username
+        metadata_user_id = metadata_user_id or self.user_id
+        avatar_user_id = avatar_user_id or self.user_id
+        marker = (
+            '<main itemtype="https://schema.org/Person"></main>'
+            if include_profile_marker
+            else ""
+        )
+
+        return f"""
+            <html>
+                <head>
+                    <title>{self.username} (Test User) · GitHub</title>
+                    <link rel="canonical"
+                        href="https://github.com/{canonical_username}">
+                    <meta property="og:url"
+                        content="https://github.com/{og_username}">
+                    <meta property="og:type" content="profile">
+                    <meta property="og:title"
+                        content="{self.username} - Overview">
+                    <meta property="og:image"
+                        content="https://avatars.githubusercontent.com/u/{avatar_user_id}?v=4">
+                    <meta property="profile:username"
+                        content="{metadata_username}">
+                    <meta name="octolytics-dimension-user_login"
+                        content="{metadata_username}">
+                    <meta name="octolytics-dimension-user_id"
+                        content="{metadata_user_id}">
+                </head>
+                <body>{marker}</body>
+            </html>
+        """
+
+    def test_github_complete_public_profile_is_found(self):
+        result = self.check(
+            self.response(200, text=self.profile_html())
+        )
+
+        self.assertEqual(result[1], FOUND)
+        self.assertEqual(
+            result[3],
+            "public GitHub profile found; identity not verified",
+        )
+
+    def test_github_confirmed_404_is_not_found(self):
+        result = self.check(self.response(404, text="Not Found"))
+
+        self.assertEqual(result[1], NOT_FOUND)
+
+    def test_github_username_conflict_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.profile_html(metadata_username="AnotherUser"),
+            )
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_github_canonical_conflict_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.profile_html(
+                    canonical_username="AnotherUser",
+                ),
+            )
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_github_og_url_conflict_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.profile_html(og_username="AnotherUser"),
+            )
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_github_stable_id_conflict_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.profile_html(avatar_user_id="987654321"),
+            )
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_github_missing_profile_marker_is_possible(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.profile_html(include_profile_marker=False),
+            )
+        )
+
+        self.assertEqual(result[1], POSSIBLE)
+
+    def test_github_403_is_blocked(self):
+        result = self.check(self.response(403))
+
+        self.assertEqual(result[1], BLOCKED)
+
+    def test_github_429_is_rate_limited(self):
+        result = self.check(self.response(429))
+
+        self.assertEqual(result[1], RATE_LIMIT)
+
+    def test_github_5xx_is_error(self):
+        result = self.check(self.response(503))
+
+        self.assertEqual(result[1], ERROR)
+
+    def test_github_config_uses_dedicated_checker(self):
+        config = load_sites_config()["GitHub"]
+
+        self.assertEqual(config["checker"], "github_profile")
+        self.assertEqual(config["not_found_status_codes"], [404])
+
+
+class InstagramProfileDetectionTests(unittest.TestCase):
+    def setUp(self):
+        self.site_name = "Instagram"
+        self.username = "TestUser"
+        self.profile_id = "123456789"
+        self.site_config = {
+            "url": "https://www.instagram.com/{username}",
+            "checker": "instagram_profile",
+            "needs_login": True,
+            "rate_limit_delay": 0,
+        }
+
+    def response(self, status_code, text="", url=None):
+        response = Mock()
+        response.status_code = status_code
+        response.text = text
+        response.url = (
+            url
+            or f"https://www.instagram.com/{self.username}/"
+        )
+        return response
+
+    def check(self, response):
+        with (
+            patch(
+                "main.username.requests.request",
+                return_value=response,
+            ),
+            patch("main.username.time.sleep"),
+        ):
+            return check_username_on_site(
+                self.username,
+                self.site_name,
+                self.site_config,
+            )
+
+    def profile_html(
+        self,
+        *,
+        canonical_username=None,
+        og_username=None,
+        route_username=None,
+        props_profile_id=None,
+        page_profile_id=None,
+        logging_profile_id=None,
+        include_profile_json=True,
+    ):
+        canonical_username = canonical_username or self.username
+        og_username = og_username or self.username
+        route_username = route_username or self.username
+        props_profile_id = props_profile_id or self.profile_id
+        page_profile_id = page_profile_id or props_profile_id
+        logging_profile_id = logging_profile_id or props_profile_id
+        profile_json = ""
+
+        if include_profile_json:
+            profile_json = f"""
+                <script>
+                    {{"resource":{{"__dr":
+                    "PolarisProfilePostsTabRoot.react"}},
+                    "props":{{"id":"{props_profile_id}",
+                    "page_logging":{{"name":"profilePage",
+                    "params":{{"page_id":
+                    "profilePage_{page_profile_id}",
+                    "profile_id":"{logging_profile_id}"}}}}}},
+                    "root":"PolarisLoggedOutDesktopWWWProfileRoot.react",
+                    "canonicalRouteName":
+                    "comet.igweb.PolarisLoggedOutDesktopWWWProfileRoute",
+                    "url":"/{route_username}/",
+                    "params":{{"username":"{route_username}"}}}}
+                </script>
+            """
+
+        return f"""
+            <html>
+                <head>
+                    <title>Test User (@{self.username}) • Instagram photos and videos</title>
+                    <link rel="canonical"
+                        href="https://www.instagram.com/{canonical_username}/">
+                    <meta property="og:url"
+                        content="https://www.instagram.com/{og_username}/">
+                    <meta property="og:type" content="profile">
+                    <meta property="og:title"
+                        content="Test User (@{self.username}) • Instagram photos and videos">
+                    <meta property="al:ios:url"
+                        content="instagram://user?username={route_username}">
+                    <meta property="al:android:url"
+                        content="https://instagram.com/_u/{route_username}/">
+                </head>
+                <body>{profile_json}</body>
+            </html>
+        """
+
+    def test_instagram_complete_public_profile_is_found(self):
+        result = self.check(
+            self.response(200, text=self.profile_html())
+        )
+
+        self.assertEqual(result[1], FOUND)
+        self.assertEqual(
+            result[3],
+            "public Instagram profile found; identity not verified",
+        )
+
+    def test_instagram_soft_404_http_200_is_not_found_evidence(self):
+        result = self.check(
+            self.response(200, text="<html><title>Instagram</title></html>")
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+        self.assertNotEqual(result[1], FOUND)
+
+    def test_instagram_username_conflict_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.profile_html(route_username="AnotherUser"),
+            )
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_instagram_canonical_conflict_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.profile_html(
+                    canonical_username="AnotherUser",
+                ),
+            )
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_instagram_og_url_conflict_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.profile_html(og_username="AnotherUser"),
+            )
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_instagram_stable_id_conflict_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.profile_html(page_profile_id="987654321"),
+            )
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_instagram_incomplete_profile_data_is_possible(self):
+        result = self.check(
+            self.response(
+                200,
+                text=self.profile_html(include_profile_json=False),
+            )
+        )
+
+        self.assertEqual(result[1], POSSIBLE)
+
+    def test_instagram_login_redirect_is_blocked(self):
+        result = self.check(
+            self.response(
+                200,
+                text="<html><title>Login • Instagram</title></html>",
+                url=(
+                    "https://www.instagram.com/accounts/login/"
+                    "?next=%2FTestUser%2F"
+                ),
+            )
+        )
+
+        self.assertEqual(result[1], BLOCKED)
+
+    def test_instagram_429_is_rate_limited(self):
+        result = self.check(self.response(429))
+
+        self.assertEqual(result[1], RATE_LIMIT)
+
+    def test_instagram_5xx_is_error(self):
+        result = self.check(self.response(503))
+
+        self.assertEqual(result[1], ERROR)
+
+    def test_instagram_config_uses_dedicated_checker(self):
+        config = load_sites_config()["Instagram"]
+
+        self.assertEqual(config["checker"], "instagram_profile")
+
+
 if __name__ == "__main__":
     unittest.main()
