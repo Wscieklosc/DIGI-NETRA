@@ -124,3 +124,10 @@ Raportuj krótko:
 2. Co sprawdzono.
 3. Jaki jest wynik.
 4. Czy jest coś do kontroli.
+
+## .codex
+- Folder `.codex/` jest lokalnym miejscem roboczym Codexa.
+- Codex może tam przechowywać prywatne notatki, kontekst projektu i pomocnicze informacje operacyjne.
+- `.codex/` nie jest częścią publicznego repozytorium i pozostaje w `.gitignore`.
+- Nie zapisuj tam sekretów, tokenów, haseł ani danych uwierzytelniających.
+- Oficjalne zmiany projektu wykonuj wyłącznie w normalnych plikach repozytorium.
