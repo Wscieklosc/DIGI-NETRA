@@ -16,6 +16,43 @@ Projekt jest rozwinięciem i udoskonaleniem oryginalnego repozytorium:
 - Przed publikacją wydania, produktu albo większej redystrybucji sprawdź status licencji upstreamu.
 - Nie twórz Pull Requesta do upstreamu bez wyraźnej prośby użytkownika.
 
+## Nadrzędna zasada jakości detekcji OSINT
+Zasada obowiązuje cały projekt: moduły dotyczące username, e-maili, numerów telefonu, adresów IP oraz wszystkie przyszłe moduły, na przykład domeny.
+
+Maksymalizuj skuteczność wykrywania, ale nigdy kosztem fałszywych pozytywów.
+
+Nie traktuj pojedynczego słabego sygnału jako potwierdzenia.
+
+Priorytet klasyfikacji:
+1. pewne `FOUND`,
+2. pewne `NOT_FOUND`,
+3. `POSSIBLE`,
+4. `BLOCKED` / `RATE_LIMIT`,
+5. `UNKNOWN` / `ERROR`.
+
+Jeśli serwis lub źródło nie pozwala na wiarygodne potwierdzenie, zwróć `POSSIBLE` albo `UNKNOWN` zamiast zgadywać.
+
+Jeżeli to możliwe, wykorzystuj kombinację wielu stabilnych sygnałów:
+- status HTTP,
+- final URL,
+- redirecty,
+- komunikaty błędów,
+- markery HTML,
+- canonical/meta,
+- JSON osadzony w stronie,
+- charakterystyczne odpowiedzi publicznych endpointów/API,
+- inne stabilne, publicznie dostępne sygnały.
+
+Dla każdej nowej reguły detekcji:
+- przetestuj co najmniej jeden przypadek istniejący,
+- przetestuj co najmniej jeden przypadek nieistniejący,
+- jeśli ma znaczenie, przetestuj ASCII i Unicode,
+- dodaj testy jednostkowe,
+- nie używaj prywatnych cookies, tokenów ani zalogowanych sesji,
+- nie obchodź zabezpieczeń dostępu, logowania ani antybot.
+
+Ta zasada obowiązuje cały projekt i wszystkie przyszłe rozszerzenia.
+
 ## Git i remotes
 - `origin` = `https://github.com/Wscieklosc/DIGI-NETRA.git`
 - `upstream` = `https://github.com/pwnxotus/DIGI-NETRA.git`
