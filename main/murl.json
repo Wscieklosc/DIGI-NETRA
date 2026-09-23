@@ -246,6 +246,7 @@
   },
   "Pinterest": {
     "url": "https://www.pinterest.com/{username}/",
+    "checker": "pinterest_profile",
     "detect_based_on_message": true,
     "not_found_status_codes": [404],
     "not_found_message": "show_error=true",
@@ -386,6 +387,7 @@
   },
   "SoundCloud": {
     "url": "https://soundcloud.com/{username}",
+    "checker": "soundcloud_profile",
     "detect_based_on_message": false,
     "not_found_status_codes": [404],
     "not_found_message": "We can’t find that user.",
@@ -645,6 +647,7 @@
  
   "Twitch": {
     "url": "https://www.twitch.tv/{username}",
+    "checker": "twitch_profile",
     "detect_based_on_message": true,
     "not_found_status_codes": [404],
     "not_found_message": "Page Not Found",
@@ -661,7 +664,8 @@
     "confidence_score": 0.85
   },
   "Snapchat": {
-    "url": "https://www.snapchat.com/add/{username}",
+    "url": "https://www.snapchat.com/@{username}",
+    "checker": "snapchat_profile",
     "detect_based_on_message": true,
     "not_found_status_codes": [404],
     "not_found_message": "Page Not Found",
@@ -1059,6 +1063,7 @@
   },
   "Xing": {
     "url": "https://www.xing.com/profile/{username}",
+    "checker": "xing_profile",
     "detect_based_on_message": true,
     "not_found_status_codes": [404],
     "not_found_message": "Page Not Found",

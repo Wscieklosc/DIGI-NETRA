@@ -1728,6 +1728,10 @@ class FacebookProfileDetectionTests(unittest.TestCase):
                 self.site_config,
             )
 
+    def test_config_uses_dedicated_checker(self):
+        config = load_sites_config()[self.site_name]
+        self.assertEqual(config["checker"], self.site_config["checker"])
+
     def profile_html(
         self,
         *,
@@ -2321,6 +2325,569 @@ class InstagramProfileDetectionTests(unittest.TestCase):
         config = load_sites_config()["Instagram"]
 
         self.assertEqual(config["checker"], "instagram_profile")
+
+
+class PublicProfileCheckerMixin:
+    username = "Test_User"
+    site_name = ""
+    site_config = {}
+    default_url = ""
+
+    def response(self, status_code, text="", url=None):
+        response = Mock()
+        response.status_code = status_code
+        response.text = text
+        response.url = url or self.default_url
+        return response
+
+    def check(self, response):
+        with (
+            patch(
+                "main.username.requests.request",
+                return_value=response,
+            ),
+            patch("main.username.time.sleep"),
+        ):
+            return check_username_on_site(
+                self.username,
+                self.site_name,
+                self.site_config,
+            )
+
+
+class PinterestProfileDetectionTests(
+    PublicProfileCheckerMixin,
+    unittest.TestCase,
+):
+    site_name = "Pinterest"
+    default_url = "https://www.pinterest.com/Test_User/"
+    site_config = {
+        "url": "https://www.pinterest.com/{username}/",
+        "checker": "pinterest_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def profile_html(
+        self,
+        *,
+        canonical_username="Test_User",
+        schema_username="Test_User",
+        user_ids=("12345",),
+        include_schema=True,
+        include_initial_props=True,
+    ):
+        canonical_url = (
+            f"https://www.pinterest.com/{canonical_username}/"
+        )
+        schema = ""
+        if include_schema:
+            schema = f"""
+                <script type="application/ld+json">
+                {{
+                    "@type": "ProfilePage",
+                    "mainEntity": {{
+                        "@type": "Person",
+                        "alternateName": "{schema_username}",
+                        "url": "https://www.pinterest.com/{schema_username}/",
+                        "identifier": "https://www.pinterest.com/{schema_username}/"
+                    }}
+                }}
+                </script>
+            """
+        initial_props = ""
+        if include_initial_props:
+            users = [
+                {
+                    "type": "user",
+                    "username": self.username,
+                    "id": user_id,
+                }
+                for user_id in user_ids
+            ]
+            initial_props = (
+                '<script id="__PWS_INITIAL_PROPS__" '
+                f'type="application/json">{json.dumps({"users": users})}'
+                "</script>"
+            )
+
+        return f"""
+            <html><head>
+                <title>Test ({self.username}) - Profile | Pinterest</title>
+                <link rel="canonical" href="{canonical_url}">
+                <meta property="og:url" content="{canonical_url}">
+                <meta property="og:type" content="profile">
+                {schema}
+                {initial_props}
+            </head></html>
+        """
+
+    def test_pinterest_certain_found(self):
+        result = self.check(self.response(200, self.profile_html()))
+        self.assertEqual(result[1], FOUND)
+
+    def test_pinterest_canonical_conflict_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                self.profile_html(canonical_username="Other_User"),
+            )
+        )
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_pinterest_username_conflict_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                self.profile_html(schema_username="Other_User"),
+            )
+        )
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_pinterest_stable_id_conflict_is_unknown(self):
+        result = self.check(
+            self.response(200, self.profile_html(user_ids=("123", "456")))
+        )
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_pinterest_incomplete_data_is_possible(self):
+        result = self.check(
+            self.response(
+                200,
+                self.profile_html(include_initial_props=False),
+            )
+        )
+        self.assertEqual(result[1], POSSIBLE)
+
+    def test_pinterest_soft_404_is_unknown(self):
+        result = self.check(self.response(200, "<html><title></title></html>"))
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_pinterest_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_pinterest_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+
+class TwitchProfileDetectionTests(
+    PublicProfileCheckerMixin,
+    unittest.TestCase,
+):
+    site_name = "Twitch"
+    default_url = "https://www.twitch.tv/Test_User"
+    site_config = {
+        "url": "https://www.twitch.tv/{username}",
+        "checker": "twitch_profile",
+        "rate_limit_delay": 0,
+    }
+    profile_id = "11111111-2222-3333-4444-555555555555"
+
+    def profile_html(
+        self,
+        *,
+        canonical_username="Test_User",
+        schema_username="Test_User",
+        schema_id=None,
+        og_id=None,
+        include_schema=True,
+    ):
+        schema_id = schema_id or self.profile_id
+        og_id = og_id or self.profile_id
+        canonical_url = f"https://www.twitch.tv/{canonical_username}"
+        schema = ""
+        if include_schema:
+            schema = f"""
+                <script type="application/ld+json">
+                {{
+                    "@type": "ProfilePage",
+                    "mainEntity": {{
+                        "@type": "Person",
+                        "alternateName": "{schema_username}",
+                        "url": "https://www.twitch.tv/{schema_username}",
+                        "image": "https://static-cdn.jtvnw.net/jtv_user_pictures/{schema_id}-profile_image-300x300.png"
+                    }}
+                }}
+                </script>
+            """
+        return f"""
+            <html><head>
+                <title>Test User - Twitch</title>
+                <link rel="canonical" href="{canonical_url}">
+                <meta property="og:url" content="{canonical_url}">
+                <meta property="og:type" content="profile">
+                <meta property="og:image" content="https://static-cdn.jtvnw.net/jtv_user_pictures/{og_id}-profile_image-300x300.png">
+                {schema}
+            </head></html>
+        """
+
+    def test_twitch_certain_found(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html()))[1],
+            FOUND,
+        )
+
+    def test_twitch_canonical_conflict_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                self.profile_html(canonical_username="Other_User"),
+            )
+        )
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_twitch_username_conflict_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                self.profile_html(schema_username="Other_User"),
+            )
+        )
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_twitch_stable_id_conflict_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                self.profile_html(
+                    og_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                ),
+            )
+        )
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_twitch_incomplete_data_is_possible(self):
+        result = self.check(
+            self.response(200, self.profile_html(include_schema=False))
+        )
+        self.assertEqual(result[1], POSSIBLE)
+
+    def test_twitch_soft_404_is_unknown(self):
+        html = '<html><head><title>Twitch</title><meta property="og:type" content="website"></head></html>'
+        self.assertEqual(self.check(self.response(200, html))[1], UNKNOWN)
+
+    def test_twitch_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_twitch_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+
+class SoundCloudProfileDetectionTests(
+    PublicProfileCheckerMixin,
+    unittest.TestCase,
+):
+    site_name = "SoundCloud"
+    default_url = "https://soundcloud.com/Test_User"
+    site_config = {
+        "url": "https://soundcloud.com/{username}",
+        "checker": "soundcloud_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def profile_html(
+        self,
+        *,
+        canonical_username="Test_User",
+        permalink="Test_User",
+        user_id="12345",
+        urn_id="12345",
+        deep_link_id="12345",
+        include_deep_links=True,
+    ):
+        canonical_url = f"https://soundcloud.com/{canonical_username}"
+        hydration = [{
+            "hydratable": "user",
+            "data": {
+                "id": int(user_id) if user_id.isdigit() else user_id,
+                "kind": "user",
+                "permalink": permalink,
+                "permalink_url": f"https://soundcloud.com/{permalink}",
+                "url": f"/{permalink}",
+                "urn": f"soundcloud:users:{urn_id}",
+                "uri": (
+                    "https://api.soundcloud.com/users/"
+                    f"soundcloud%3Ausers%3A{urn_id}"
+                ),
+            },
+        }]
+        deep_links = ""
+        if include_deep_links:
+            deep_links = f"""
+                <meta property="al:ios:url" content="soundcloud://users:{deep_link_id}">
+                <meta property="al:android:url" content="soundcloud://users:{deep_link_id}">
+            """
+        return f"""
+            <html><head>
+                <title>Stream Test User on SoundCloud</title>
+                <link rel="canonical" href="{canonical_url}">
+                <meta property="og:url" content="{canonical_url}">
+                <meta property="og:type" content="music.musician">
+                {deep_links}
+                <script>window.__sc_hydration = {json.dumps(hydration)};</script>
+            </head></html>
+        """
+
+    def test_soundcloud_certain_found(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html()))[1],
+            FOUND,
+        )
+
+    def test_soundcloud_canonical_conflict_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                self.profile_html(canonical_username="Other_User"),
+            )
+        )
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_soundcloud_username_conflict_is_unknown(self):
+        result = self.check(
+            self.response(200, self.profile_html(permalink="Other_User"))
+        )
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_soundcloud_stable_id_conflict_is_unknown(self):
+        result = self.check(
+            self.response(200, self.profile_html(urn_id="99999"))
+        )
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_soundcloud_incomplete_data_is_possible(self):
+        result = self.check(
+            self.response(
+                200,
+                self.profile_html(include_deep_links=False),
+            )
+        )
+        self.assertEqual(result[1], POSSIBLE)
+
+    def test_soundcloud_confirmed_404_is_not_found(self):
+        html = "<html><title>SoundCloud - Hear the world’s sounds</title></html>"
+        self.assertEqual(self.check(self.response(404, html))[1], NOT_FOUND)
+
+    def test_soundcloud_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_soundcloud_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+
+class XingProfileDetectionTests(
+    PublicProfileCheckerMixin,
+    unittest.TestCase,
+):
+    site_name = "Xing"
+    default_url = "https://www.xing.com/profile/Test_User"
+    site_config = {
+        "url": "https://www.xing.com/profile/{username}",
+        "checker": "xing_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def profile_html(
+        self,
+        *,
+        canonical_username="test_user",
+        record_username="Test_User",
+        stable_id="12345.abc123",
+        include_runtime=True,
+    ):
+        canonical_url = (
+            f"https://www.xing.com/profile/{canonical_username}"
+        )
+        runtime = ""
+        if include_runtime:
+            reference = f"XingId:{stable_id}"
+            crate = {
+                "serverData": {
+                    "APOLLO_STATE": {
+                        "ROOT_QUERY": {
+                            'xingIdWithError({"id":"Test_User"})': {
+                                "__ref": reference,
+                            },
+                        },
+                        reference: {
+                            "__typename": "XingId",
+                            "id": stable_id,
+                            "pageName": record_username,
+                        },
+                    },
+                },
+            }
+            runtime = (
+                '<script id="runtime-config">window.crate='
+                f"{json.dumps(crate)}</script>"
+            )
+        return f"""
+            <html><head>
+                <title>Test User - Developer | XING</title>
+                <link rel="canonical" href="{canonical_url}">
+                <meta property="og:url" content="{canonical_url}">
+                <meta property="og:type" content="profile">
+                {runtime}
+            </head></html>
+        """
+
+    def test_xing_certain_found_and_casefolded_canonical(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html()))[1],
+            FOUND,
+        )
+
+    def test_xing_canonical_conflict_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                self.profile_html(canonical_username="Other_User"),
+            )
+        )
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_xing_username_conflict_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                self.profile_html(record_username="Other_User"),
+            )
+        )
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_xing_stable_id_conflict_is_unknown(self):
+        result = self.check(
+            self.response(200, self.profile_html(stable_id="invalid"))
+        )
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_xing_incomplete_data_is_possible(self):
+        result = self.check(
+            self.response(200, self.profile_html(include_runtime=False))
+        )
+        self.assertEqual(result[1], POSSIBLE)
+
+    def test_xing_confirmed_404_is_not_found(self):
+        html = "<html><title>404 - Not Found | XING</title></html>"
+        self.assertEqual(self.check(self.response(404, html))[1], NOT_FOUND)
+
+    def test_xing_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_xing_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+
+class SnapchatProfileDetectionTests(
+    PublicProfileCheckerMixin,
+    unittest.TestCase,
+):
+    site_name = "Snapchat"
+    default_url = "https://www.snapchat.com/@Test_User"
+    site_config = {
+        "url": "https://www.snapchat.com/@{username}",
+        "checker": "snapchat_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def profile_html(
+        self,
+        *,
+        canonical_username="Test_User",
+        public_username="Test_User",
+        stable_id="11111111-2222-3333-4444-555555555555",
+        include_schema=True,
+    ):
+        canonical_url = (
+            f"https://www.snapchat.com/@{canonical_username}"
+        )
+        next_data = {
+            "props": {
+                "pageProps": {
+                    "userProfile": {
+                        "$case": "publicProfileInfo",
+                        "publicProfileInfo": {
+                            "username": public_username,
+                            "title": "Test User",
+                            "hostUserId": stable_id,
+                        },
+                    },
+                },
+            },
+        }
+        schema = ""
+        if include_schema:
+            schema = f"""
+                <script type="application/ld+json">
+                {{
+                    "@type": "ProfilePage",
+                    "mainEntity": {{
+                        "@type": "Person",
+                        "alternateName": "{public_username}",
+                        "url": "https://www.snapchat.com/@{public_username}"
+                    }}
+                }}
+                </script>
+            """
+        return f"""
+            <html><head>
+                <title>Test User (@{self.username}) | Snapchat</title>
+                <link rel="canonical" href="{canonical_url}">
+                <meta property="og:url" content="{canonical_url}">
+                {schema}
+                <script id="__NEXT_DATA__" type="application/json">{json.dumps(next_data)}</script>
+            </head></html>
+        """
+
+    def test_snapchat_certain_found(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html()))[1],
+            FOUND,
+        )
+
+    def test_snapchat_canonical_conflict_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                self.profile_html(canonical_username="Other_User"),
+            )
+        )
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_snapchat_username_conflict_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                self.profile_html(public_username="Other_User"),
+            )
+        )
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_snapchat_stable_id_conflict_is_unknown(self):
+        result = self.check(
+            self.response(200, self.profile_html(stable_id="invalid"))
+        )
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_snapchat_incomplete_data_is_possible(self):
+        result = self.check(
+            self.response(200, self.profile_html(include_schema=False))
+        )
+        self.assertEqual(result[1], POSSIBLE)
+
+    def test_snapchat_404_is_unknown_not_account_not_found(self):
+        html = "<html><title>Snapchat</title></html>"
+        self.assertEqual(self.check(self.response(404, html))[1], UNKNOWN)
+
+    def test_snapchat_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_snapchat_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+    def test_snapchat_config_uses_new_public_profile_endpoint(self):
+        config = load_sites_config()["Snapchat"]
+        self.assertEqual(config["url"], "https://www.snapchat.com/@{username}")
+        self.assertEqual(config["checker"], "snapchat_profile")
 
 
 if __name__ == "__main__":

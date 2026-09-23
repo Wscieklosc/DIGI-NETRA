@@ -3124,6 +3124,932 @@ def classify_instagram_profile_response(username, response, profile_url):
 
 
 # ============================================================
+# WSPOLNE NARZEDZIA DLA PUBLICZNYCH PROFILI
+# ============================================================
+
+def _public_profile_url_matches(value, hosts, expected_path):
+    if not isinstance(value, str) or not value:
+        return False
+
+    parsed = urlparse(value)
+
+    return (
+        parsed.scheme in ("http", "https")
+        and parsed.netloc.casefold() in hosts
+        and unquote(parsed.path).rstrip("/").casefold()
+        == expected_path.rstrip("/").casefold()
+    )
+
+
+def _public_profile_meta(soup, attribute, name):
+    node = soup.find("meta", attrs={attribute: name})
+    return node.get("content", "") if node else ""
+
+
+def _public_profile_canonical(soup):
+    node = soup.find(
+        "link",
+        rel=lambda value: value and "canonical" in value,
+    )
+    return node.get("href", "") if node else ""
+
+
+def _walk_public_json(value):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _walk_public_json(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _walk_public_json(child)
+
+
+def _public_json_ld_documents(soup):
+    documents = []
+
+    for node in soup.select('script[type="application/ld+json"]'):
+        try:
+            documents.append(json.loads(node.string or node.get_text()))
+        except (TypeError, json.JSONDecodeError):
+            continue
+
+    return documents
+
+
+def _public_profile_transport_result(response, service_name):
+    status_code = response.status_code
+    final_path = unquote(urlparse(response.url or "").path).casefold()
+
+    if status_code == 429:
+        return RATE_LIMIT, None, "HTTP 429"
+
+    if status_code in (401, 403):
+        return BLOCKED, None, f"HTTP {status_code}"
+
+    if status_code >= 500:
+        return ERROR, None, f"HTTP {status_code}"
+
+    blocked_paths = (
+        "/login",
+        "/signin",
+        "/checkpoint",
+        "/challenge",
+        "/captcha",
+        "/accounts/login",
+    )
+
+    if any(
+        final_path == marker or final_path.startswith(f"{marker}/")
+        for marker in blocked_paths
+    ):
+        return (
+            BLOCKED,
+            None,
+            f"{service_name} login or challenge redirect",
+        )
+
+    return None
+
+
+# ============================================================
+# SPECJALNA DETEKCJA PROFILI PINTEREST
+# ============================================================
+
+def _pinterest_profile_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        ("pinterest.com", "www.pinterest.com"),
+        f"/{username}",
+    )
+
+
+def classify_pinterest_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(
+        response,
+        "Pinterest",
+    )
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    canonical_url = _public_profile_canonical(soup)
+    og_url = _public_profile_meta(soup, "property", "og:url")
+    og_type = _public_profile_meta(soup, "property", "og:type")
+    expected_username = username.casefold()
+
+    final_matches = _pinterest_profile_url_matches(response.url, username)
+    canonical_matches = _pinterest_profile_url_matches(
+        canonical_url,
+        username,
+    )
+    og_url_matches = _pinterest_profile_url_matches(og_url, username)
+
+    profile_pages = [
+        item
+        for document in _public_json_ld_documents(soup)
+        for item in _walk_public_json(document)
+        if item.get("@type") == "ProfilePage"
+    ]
+    profile_people = [
+        item.get("mainEntity")
+        for item in profile_pages
+        if isinstance(item.get("mainEntity"), dict)
+        and item["mainEntity"].get("@type") == "Person"
+    ]
+
+    schema_usernames = {
+        item.get("alternateName", "").casefold()
+        for item in profile_people
+        if isinstance(item.get("alternateName"), str)
+        and item.get("alternateName")
+    }
+    schema_urls = {
+        value
+        for item in profile_people
+        for value in (item.get("url"), item.get("identifier"))
+        if isinstance(value, str) and value
+    }
+
+    initial_props = {}
+    initial_props_node = soup.select_one("script#__PWS_INITIAL_PROPS__")
+    if initial_props_node:
+        try:
+            initial_props = json.loads(
+                initial_props_node.string or initial_props_node.get_text()
+            )
+        except (TypeError, json.JSONDecodeError):
+            initial_props = {}
+
+    matching_users = [
+        item
+        for item in _walk_public_json(initial_props)
+        if isinstance(item.get("username"), str)
+        and item.get("username", "").casefold() == expected_username
+        and item.get("type") == "user"
+    ]
+    stable_ids = {
+        str(item.get("id"))
+        for item in matching_users
+        if item.get("id") not in (None, "")
+    }
+    invalid_stable_id = any(not value.isdigit() for value in stable_ids)
+
+    final_conflict = bool(response.url and not final_matches)
+    canonical_conflict = bool(canonical_url and not canonical_matches)
+    og_url_conflict = bool(og_url and not og_url_matches)
+    schema_username_conflict = bool(
+        schema_usernames and schema_usernames != {expected_username}
+    )
+    schema_url_conflict = any(
+        not _pinterest_profile_url_matches(value, username)
+        for value in schema_urls
+    )
+    stable_id_conflict = len(stable_ids) > 1 or invalid_stable_id
+
+    if any((
+        final_conflict,
+        canonical_conflict,
+        og_url_conflict,
+        schema_username_conflict,
+        schema_url_conflict,
+        stable_id_conflict,
+    )):
+        return UNKNOWN, None, "Pinterest profile evidence conflict"
+
+    if response.status_code >= 400:
+        return (
+            UNKNOWN,
+            None,
+            f"unconfirmed Pinterest HTTP {response.status_code}; "
+            "account existence unknown",
+        )
+
+    if response.status_code != 200 or not final_matches:
+        return UNKNOWN, None, "unexpected Pinterest final URL"
+
+    title_matches = f"({username})".casefold() in title.casefold()
+    schema_matches = (
+        len(profile_pages) == 1
+        and len(profile_people) == 1
+        and schema_usernames == {expected_username}
+        and bool(schema_urls)
+        and all(
+            _pinterest_profile_url_matches(value, username)
+            for value in schema_urls
+        )
+    )
+
+    if (
+        canonical_matches
+        and og_url_matches
+        and og_type.casefold() == "profile"
+        and title_matches
+        and schema_matches
+        and len(stable_ids) == 1
+    ):
+        return (
+            FOUND,
+            profile_url,
+            "public Pinterest profile found; identity not verified",
+        )
+
+    profile_evidence = any((
+        canonical_url,
+        og_url,
+        profile_pages,
+        matching_users,
+    ))
+    if profile_evidence:
+        return (
+            POSSIBLE,
+            profile_url,
+            "incomplete Pinterest public profile evidence",
+        )
+
+    return (
+        UNKNOWN,
+        None,
+        "Pinterest public profile not confirmed; account existence unknown",
+    )
+
+
+# ============================================================
+# SPECJALNA DETEKCJA KANALOW TWITCH
+# ============================================================
+
+def _twitch_profile_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        ("twitch.tv", "www.twitch.tv"),
+        f"/{username}",
+    )
+
+
+def _twitch_profile_image_id(value):
+    if not isinstance(value, str) or not value:
+        return None
+
+    parsed = urlparse(value)
+    if parsed.netloc.casefold() != "static-cdn.jtvnw.net":
+        return None
+
+    match = re.search(
+        r"/jtv_user_pictures/"
+        r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+        r"[0-9a-f]{4}-[0-9a-f]{12})-profile_image-",
+        parsed.path,
+        re.IGNORECASE,
+    )
+    return match.group(1).casefold() if match else None
+
+
+def classify_twitch_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(
+        response,
+        "Twitch",
+    )
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    canonical_url = _public_profile_canonical(soup)
+    og_url = _public_profile_meta(soup, "property", "og:url")
+    og_type = _public_profile_meta(soup, "property", "og:type")
+    og_image = _public_profile_meta(soup, "property", "og:image")
+    expected_username = username.casefold()
+
+    final_matches = _twitch_profile_url_matches(response.url, username)
+    canonical_matches = _twitch_profile_url_matches(
+        canonical_url,
+        username,
+    )
+    og_url_matches = _twitch_profile_url_matches(og_url, username)
+
+    profile_people = []
+    for document in _public_json_ld_documents(soup):
+        for item in _walk_public_json(document):
+            if item.get("@type") != "ProfilePage":
+                continue
+            person = item.get("mainEntity")
+            if isinstance(person, dict) and person.get("@type") == "Person":
+                profile_people.append(person)
+
+    public_usernames = {
+        item.get("alternateName", "").casefold()
+        for item in profile_people
+        if isinstance(item.get("alternateName"), str)
+        and item.get("alternateName")
+    }
+    public_urls = {
+        item.get("url")
+        for item in profile_people
+        if isinstance(item.get("url"), str) and item.get("url")
+    }
+    profile_image_ids = {
+        value
+        for value in (
+            *(
+                _twitch_profile_image_id(item.get("image"))
+                for item in profile_people
+            ),
+            _twitch_profile_image_id(og_image),
+        )
+        if value
+    }
+
+    conflicts = (
+        bool(response.url and not final_matches),
+        bool(canonical_url and not canonical_matches),
+        bool(og_url and not og_url_matches),
+        bool(public_usernames and public_usernames != {expected_username}),
+        any(
+            not _twitch_profile_url_matches(value, username)
+            for value in public_urls
+        ),
+        len(profile_image_ids) > 1,
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "Twitch channel evidence conflict"
+
+    if response.status_code >= 400:
+        return (
+            UNKNOWN,
+            None,
+            f"unconfirmed Twitch HTTP {response.status_code}; "
+            "channel existence unknown",
+        )
+
+    if response.status_code != 200 or not final_matches:
+        return UNKNOWN, None, "unexpected Twitch final URL"
+
+    if (
+        canonical_matches
+        and og_url_matches
+        and og_type.casefold() == "profile"
+        and title.casefold().endswith(" - twitch")
+        and title.casefold() != "twitch"
+        and len(profile_people) == 1
+        and public_usernames == {expected_username}
+        and len(public_urls) == 1
+        and len(profile_image_ids) == 1
+    ):
+        return (
+            FOUND,
+            profile_url,
+            "public Twitch channel found; identity not verified",
+        )
+
+    profile_evidence = any((
+        canonical_url,
+        og_url,
+        profile_people,
+        og_type.casefold() == "profile",
+    ))
+    if profile_evidence:
+        return (
+            POSSIBLE,
+            profile_url,
+            "incomplete Twitch public channel evidence",
+        )
+
+    return (
+        UNKNOWN,
+        None,
+        "Twitch public channel not confirmed; account existence unknown",
+    )
+
+
+# ============================================================
+# SPECJALNA DETEKCJA PROFILI SOUNDCLOUD
+# ============================================================
+
+def _soundcloud_profile_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        ("soundcloud.com", "www.soundcloud.com"),
+        f"/{username}",
+    )
+
+
+def _soundcloud_profile_reference_matches(value, username):
+    if isinstance(value, str) and value.startswith("/"):
+        return (
+            unquote(value).rstrip("/").casefold()
+            == f"/{username}".casefold()
+        )
+
+    return _soundcloud_profile_url_matches(value, username)
+
+
+def _soundcloud_hydrated_users(soup):
+    for node in soup.find_all("script"):
+        script = node.string or node.get_text()
+        marker_position = script.find("window.__sc_hydration")
+        if marker_position < 0:
+            continue
+
+        assignment_position = script.find("=", marker_position)
+        if assignment_position < 0:
+            continue
+
+        try:
+            hydration, _ = json.JSONDecoder().raw_decode(
+                script[assignment_position + 1:].lstrip()
+            )
+        except json.JSONDecodeError:
+            continue
+
+        if not isinstance(hydration, list):
+            continue
+
+        return [
+            item.get("data")
+            for item in hydration
+            if isinstance(item, dict)
+            and item.get("hydratable") == "user"
+            and isinstance(item.get("data"), dict)
+        ]
+
+    return []
+
+
+def _soundcloud_deep_link_id(value):
+    if not isinstance(value, str):
+        return None
+
+    match = re.fullmatch(r"soundcloud://users:(\d+)", value.strip())
+    return match.group(1) if match else None
+
+
+def classify_soundcloud_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(
+        response,
+        "SoundCloud",
+    )
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    canonical_url = _public_profile_canonical(soup)
+    og_url = _public_profile_meta(soup, "property", "og:url")
+    og_type = _public_profile_meta(soup, "property", "og:type")
+    expected_username = username.casefold()
+
+    final_matches = _soundcloud_profile_url_matches(response.url, username)
+    canonical_matches = _soundcloud_profile_url_matches(
+        canonical_url,
+        username,
+    )
+    og_url_matches = _soundcloud_profile_url_matches(og_url, username)
+    hydrated_users = _soundcloud_hydrated_users(soup)
+    profile_user = hydrated_users[0] if len(hydrated_users) == 1 else None
+
+    public_slugs = {
+        str(item.get("permalink")).casefold()
+        for item in hydrated_users
+        if item.get("permalink")
+    }
+    public_urls = {
+        value
+        for item in hydrated_users
+        for value in (item.get("permalink_url"), item.get("url"))
+        if isinstance(value, str) and value
+    }
+    stable_ids = {
+        str(item.get("id"))
+        for item in hydrated_users
+        if item.get("id") not in (None, "")
+    }
+    referenced_ids = set()
+    for item in hydrated_users:
+        urn_match = re.fullmatch(
+            r"soundcloud:users:(\d+)",
+            str(item.get("urn", "")),
+        )
+        uri_match = re.fullmatch(
+            r"https://api\.soundcloud\.com/users/"
+            r"soundcloud%3Ausers%3A(\d+)",
+            str(item.get("uri", "")),
+            re.IGNORECASE,
+        )
+        if urn_match:
+            referenced_ids.add(urn_match.group(1))
+        if uri_match:
+            referenced_ids.add(uri_match.group(1))
+
+    deep_link_ids = {
+        value
+        for node in soup.find_all(
+            "meta",
+            attrs={"property": re.compile(r"^al:(?:ios|android):url$")},
+        )
+        for value in (_soundcloud_deep_link_id(node.get("content", "")),)
+        if value
+    }
+
+    stable_id_conflict = (
+        len(stable_ids) > 1
+        or len(referenced_ids) > 1
+        or len(deep_link_ids) > 1
+        or bool(stable_ids and referenced_ids and stable_ids != referenced_ids)
+        or bool(stable_ids and deep_link_ids and stable_ids != deep_link_ids)
+        or any(not value.isdigit() for value in stable_ids)
+    )
+    conflicts = (
+        bool(response.url and not final_matches),
+        bool(canonical_url and not canonical_matches),
+        bool(og_url and not og_url_matches),
+        bool(public_slugs and public_slugs != {expected_username}),
+        any(
+            not _soundcloud_profile_reference_matches(value, username)
+            for value in public_urls
+        ),
+        stable_id_conflict,
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "SoundCloud profile evidence conflict"
+
+    profile_evidence = any((
+        canonical_url,
+        og_url,
+        hydrated_users,
+        og_type,
+    ))
+    not_found_title = title.casefold().startswith("soundcloud - hear the")
+    if (
+        response.status_code == 404
+        and final_matches
+        and not_found_title
+        and not profile_evidence
+    ):
+        return NOT_FOUND, None, "public SoundCloud profile not found"
+
+    if response.status_code >= 400:
+        return UNKNOWN, None, f"unconfirmed SoundCloud HTTP {response.status_code}"
+
+    if response.status_code != 200 or not final_matches:
+        return UNKNOWN, None, "unexpected SoundCloud final URL"
+
+    profile_complete = bool(
+        profile_user
+        and profile_user.get("kind") == "user"
+        and public_slugs == {expected_username}
+        and stable_ids
+        and stable_ids == referenced_ids
+        and stable_ids == deep_link_ids
+    )
+    if (
+        canonical_matches
+        and og_url_matches
+        and og_type.casefold() == "music.musician"
+        and profile_complete
+    ):
+        return (
+            FOUND,
+            profile_url,
+            "public SoundCloud profile found; identity not verified",
+        )
+
+    return (
+        POSSIBLE,
+        profile_url,
+        "incomplete SoundCloud public profile evidence",
+    )
+
+
+# ============================================================
+# SPECJALNA DETEKCJA PROFILI XING
+# ============================================================
+
+def _xing_profile_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        ("xing.com", "www.xing.com"),
+        f"/profile/{username}",
+    )
+
+
+def _xing_runtime_state(soup):
+    node = soup.select_one("script#runtime-config")
+    if not node:
+        return {}
+
+    script = node.string or node.get_text()
+    marker = "window.crate="
+    marker_position = script.find(marker)
+    if marker_position < 0:
+        return {}
+
+    serialized = script[marker_position + len(marker):]
+    serialized = re.sub(r"\bundefined\b", "null", serialized)
+
+    try:
+        value, _ = json.JSONDecoder().raw_decode(serialized)
+    except json.JSONDecodeError:
+        return {}
+
+    return value if isinstance(value, dict) else {}
+
+
+def _xing_profile_record(runtime_state, username):
+    state = (
+        runtime_state.get("serverData", {}).get("APOLLO_STATE", {})
+        if isinstance(runtime_state, dict)
+        else {}
+    )
+    if not isinstance(state, dict):
+        return None
+
+    root_query = state.get("ROOT_QUERY", {})
+    references = []
+    if isinstance(root_query, dict):
+        for key, value in root_query.items():
+            if not key.startswith("xingIdWithError("):
+                continue
+            if f'"id":"{username}"'.casefold() not in key.casefold():
+                continue
+            if isinstance(value, dict) and isinstance(value.get("__ref"), str):
+                references.append(value["__ref"])
+
+    records = [
+        state.get(reference)
+        for reference in references
+        if isinstance(state.get(reference), dict)
+    ]
+    return records[0] if len(records) == 1 else None
+
+
+def classify_xing_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(response, "XING")
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    canonical_url = _public_profile_canonical(soup)
+    og_url = _public_profile_meta(soup, "property", "og:url")
+    og_type = _public_profile_meta(soup, "property", "og:type")
+    expected_username = username.casefold()
+
+    final_matches = _xing_profile_url_matches(response.url, username)
+    canonical_matches = _xing_profile_url_matches(canonical_url, username)
+    og_url_matches = _xing_profile_url_matches(og_url, username)
+
+    runtime_state = _xing_runtime_state(soup)
+    profile_record = _xing_profile_record(runtime_state, username)
+    record_username = (
+        str(profile_record.get("pageName", "")).casefold()
+        if profile_record
+        else ""
+    )
+    stable_id = str(profile_record.get("id", "")) if profile_record else ""
+    stable_id_valid = bool(
+        re.fullmatch(r"\d+\.[0-9a-f]+", stable_id, re.IGNORECASE)
+    )
+
+    profile_people = [
+        item
+        for document in _public_json_ld_documents(soup)
+        for item in _walk_public_json(document)
+        if item.get("@type") == "Person"
+    ]
+    schema_urls = {
+        item.get("sameAs")
+        for item in profile_people
+        if isinstance(item.get("sameAs"), str) and item.get("sameAs")
+    }
+
+    conflicts = (
+        bool(response.url and not final_matches),
+        bool(canonical_url and not canonical_matches),
+        bool(og_url and not og_url_matches),
+        bool(record_username and record_username != expected_username),
+        bool(stable_id and not stable_id_valid),
+        any(
+            not _xing_profile_url_matches(value, username)
+            for value in schema_urls
+        ),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "XING profile evidence conflict"
+
+    profile_evidence = any((
+        canonical_url,
+        og_url,
+        profile_record,
+        profile_people,
+        og_type,
+    ))
+    if (
+        response.status_code == 404
+        and final_matches
+        and title.casefold() == "404 - not found | xing"
+        and not profile_evidence
+    ):
+        return NOT_FOUND, None, "public XING profile not found"
+
+    if response.status_code >= 400:
+        return UNKNOWN, None, f"unconfirmed XING HTTP {response.status_code}"
+
+    if response.status_code != 200 or not final_matches:
+        return UNKNOWN, None, "unexpected XING final URL"
+
+    if (
+        canonical_matches
+        and og_url_matches
+        and og_type.casefold() == "profile"
+        and title.casefold().endswith("| xing")
+        and record_username == expected_username
+        and stable_id_valid
+    ):
+        return (
+            FOUND,
+            profile_url,
+            "public XING profile found; identity not verified",
+        )
+
+    return (
+        POSSIBLE,
+        profile_url,
+        "incomplete XING public profile evidence",
+    )
+
+
+# ============================================================
+# SPECJALNA DETEKCJA PUBLICZNYCH PROFILI SNAPCHAT
+# ============================================================
+
+def _snapchat_profile_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        ("snapchat.com", "www.snapchat.com"),
+        f"/@{username}",
+    )
+
+
+def _snapchat_public_profile(soup):
+    node = soup.select_one("script#__NEXT_DATA__")
+    if not node:
+        return {}, ""
+
+    try:
+        data = json.loads(node.string or node.get_text())
+    except (TypeError, json.JSONDecodeError):
+        return {}, ""
+
+    user_profile = data.get("props", {}).get("pageProps", {}).get(
+        "userProfile",
+        {},
+    )
+    if not isinstance(user_profile, dict):
+        return {}, ""
+
+    public_profile = user_profile.get("publicProfileInfo", {})
+    if not isinstance(public_profile, dict):
+        public_profile = {}
+
+    return public_profile, str(user_profile.get("$case", ""))
+
+
+def classify_snapchat_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(
+        response,
+        "Snapchat",
+    )
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    canonical_url = _public_profile_canonical(soup)
+    og_url = _public_profile_meta(soup, "property", "og:url")
+    expected_username = username.casefold()
+
+    final_matches = _snapchat_profile_url_matches(response.url, username)
+    canonical_matches = _snapchat_profile_url_matches(
+        canonical_url,
+        username,
+    )
+    og_url_matches = _snapchat_profile_url_matches(og_url, username)
+
+    public_profile, profile_case = _snapchat_public_profile(soup)
+    public_username = str(public_profile.get("username", "")).casefold()
+    stable_ids = [
+        str(public_profile.get(key, ""))
+        for key in ("businessProfileId", "hostUserId")
+        if public_profile.get(key)
+    ]
+    uuid_pattern = re.compile(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+        r"[0-9a-f]{4}-[0-9a-f]{12}",
+        re.IGNORECASE,
+    )
+    invalid_stable_id = any(
+        not uuid_pattern.fullmatch(value)
+        for value in stable_ids
+    )
+
+    profile_pages = [
+        item
+        for document in _public_json_ld_documents(soup)
+        for item in _walk_public_json(document)
+        if item.get("@type") == "ProfilePage"
+    ]
+    profile_people = [
+        item.get("mainEntity")
+        for item in profile_pages
+        if isinstance(item.get("mainEntity"), dict)
+        and item["mainEntity"].get("@type") in ("Person", "Organization")
+    ]
+    schema_usernames = {
+        item.get("alternateName", "").casefold()
+        for item in profile_people
+        if isinstance(item.get("alternateName"), str)
+        and item.get("alternateName")
+    }
+    schema_urls = {
+        item.get("url")
+        for item in profile_people
+        if isinstance(item.get("url"), str) and item.get("url")
+    }
+
+    conflicts = (
+        bool(response.url and not final_matches),
+        bool(canonical_url and not canonical_matches),
+        bool(og_url and not og_url_matches),
+        bool(public_username and public_username != expected_username),
+        bool(schema_usernames and schema_usernames != {expected_username}),
+        any(
+            not _snapchat_profile_url_matches(value, username)
+            for value in schema_urls
+        ),
+        invalid_stable_id,
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "Snapchat public profile evidence conflict"
+
+    if response.status_code >= 400:
+        return (
+            UNKNOWN,
+            None,
+            f"Snapchat public profile not confirmed (HTTP "
+            f"{response.status_code}); account existence unknown",
+        )
+
+    if response.status_code != 200 or not final_matches:
+        return UNKNOWN, None, "unexpected Snapchat final URL"
+
+    title_matches = f"(@{username})".casefold() in title.casefold()
+    schema_complete = (
+        len(profile_pages) == 1
+        and len(profile_people) == 1
+        and schema_usernames == {expected_username}
+        and len(schema_urls) == 1
+        and all(
+            _snapchat_profile_url_matches(value, username)
+            for value in schema_urls
+        )
+    )
+
+    if (
+        canonical_matches
+        and og_url_matches
+        and title_matches
+        and profile_case == "publicProfileInfo"
+        and public_username == expected_username
+        and bool(public_profile.get("title"))
+        and schema_complete
+    ):
+        return (
+            FOUND,
+            profile_url,
+            "public Snapchat profile found; identity not verified",
+        )
+
+    profile_evidence = any((
+        canonical_url,
+        og_url,
+        public_profile,
+        profile_pages,
+    ))
+    if profile_evidence:
+        return (
+            POSSIBLE,
+            profile_url,
+            "incomplete Snapchat public profile evidence",
+        )
+
+    return (
+        UNKNOWN,
+        None,
+        "Snapchat public profile not confirmed; account existence unknown",
+    )
+
+
+# ============================================================
 # SPRAWDZANIE JEDNEGO SERWISU
 # ============================================================
 
@@ -3334,6 +4260,51 @@ def check_username_on_site(username, site_name, site_config):
                 link,
                 info,
             )
+
+        if checker == "pinterest_profile":
+            status, link, info = classify_pinterest_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "twitch_profile":
+            status, link, info = classify_twitch_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "soundcloud_profile":
+            status, link, info = classify_soundcloud_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "xing_profile":
+            status, link, info = classify_xing_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "snapchat_profile":
+            status, link, info = classify_snapchat_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
 
         # ----------------------------------------------------
         # RATE LIMIT
