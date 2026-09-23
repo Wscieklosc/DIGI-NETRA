@@ -2890,5 +2890,619 @@ class SnapchatProfileDetectionTests(
         self.assertEqual(config["checker"], "snapchat_profile")
 
 
+class GitLabProfileDetectionTests(
+    PublicProfileCheckerMixin,
+    unittest.TestCase,
+):
+    site_name = "GitLab"
+    default_url = "https://gitlab.com/Test_User"
+    site_config = {
+        "url": "https://gitlab.com/{username}",
+        "checker": "gitlab_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def profile_html(
+        self,
+        *,
+        metadata_username="Test_User",
+        user_ids=("12345", "12345"),
+        include_profile_marker=True,
+    ):
+        profile_marker = ""
+        if include_profile_marker:
+            profile_marker = (
+                '<div data-testid="user-profile-header"></div>'
+            )
+        return f"""
+            <html><head>
+                <title>Test User · GitLab</title>
+                <meta property="og:url" content="https://gitlab.com/{metadata_username}">
+                <meta property="og:type" content="object">
+                <script type="application/ld+json">
+                {{
+                    "@context": "https://schema.org",
+                    "@type": "BreadcrumbList",
+                    "itemListElement": [{{
+                        "@type": "ListItem",
+                        "position": 1,
+                        "name": "Test User",
+                        "item": "https://gitlab.com/{metadata_username}"
+                    }}]
+                }}
+                </script>
+            </head>
+            <body data-page="users:show">
+                {profile_marker}
+                <div class="js-user-profile-actions"
+                     data-rss-subscription-path="/{metadata_username}.atom"
+                     data-user-id="{user_ids[0]}"></div>
+                <div id="js-user-achievements"
+                     data-user-id="{user_ids[1]}"></div>
+            </body></html>
+        """
+
+    def test_gitlab_certain_found(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html()))[1],
+            FOUND,
+        )
+
+    def test_gitlab_username_and_url_conflict_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                self.profile_html(metadata_username="Other_User"),
+            )
+        )
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_gitlab_stable_id_conflict_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                self.profile_html(user_ids=("12345", "98765")),
+            )
+        )
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_gitlab_incomplete_data_is_possible(self):
+        result = self.check(
+            self.response(
+                200,
+                self.profile_html(include_profile_marker=False),
+            )
+        )
+        self.assertEqual(result[1], POSSIBLE)
+
+    def test_gitlab_sign_in_redirect_is_blocked(self):
+        result = self.check(
+            self.response(
+                403,
+                "<html><title>Just a moment...</title></html>",
+                url="https://gitlab.com/users/sign_in",
+            )
+        )
+        self.assertEqual(result[1], BLOCKED)
+
+    def test_gitlab_unconfirmed_404_is_unknown(self):
+        self.assertEqual(self.check(self.response(404))[1], UNKNOWN)
+
+    def test_gitlab_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+
+class DockerHubProfileDetectionTests(
+    PublicProfileCheckerMixin,
+    unittest.TestCase,
+):
+    site_name = "Docker Hub"
+    default_url = "https://hub.docker.com/u/Test_User"
+    site_config = {
+        "url": "https://hub.docker.com/u/{username}",
+        "checker": "dockerhub_profile",
+        "rate_limit_delay": 0,
+    }
+    compact_id = "11111111222233334444555555555555"
+    profile_uuid = "11111111-2222-3333-4444-555555555555"
+
+    @staticmethod
+    def flattened_router_data(value):
+        flattened = []
+
+        def add(item):
+            index = len(flattened)
+            flattened.append(None)
+            if isinstance(item, dict):
+                encoded = {}
+                flattened[index] = encoded
+                for key, child in item.items():
+                    key_index = add(str(key))
+                    child_index = add(child)
+                    encoded[f"_{key_index}"] = child_index
+            elif isinstance(item, list):
+                flattened[index] = [add(child) for child in item]
+            else:
+                flattened[index] = item
+            return index
+
+        add(value)
+        return flattened
+
+    def profile_html(
+        self,
+        *,
+        canonical_username="Test_User",
+        public_username="Test_User",
+        compact_id=None,
+        profile_uuid=None,
+        include_router=True,
+    ):
+        compact_id = compact_id or self.compact_id
+        profile_uuid = profile_uuid or self.profile_uuid
+        canonical_url = (
+            f"https://hub.docker.com/u/{canonical_username}"
+        )
+        router_script = ""
+        if include_router:
+            router_data = {
+                "loaderData": {
+                    "routes/_layout.u.$namespace": {
+                        "canonicalUrl": canonical_url,
+                        "profile": {
+                            "id": compact_id,
+                            "uuid": profile_uuid,
+                            "type": "organization",
+                            "orgname": public_username,
+                            "full_name": "Test Organization",
+                        },
+                    },
+                },
+            }
+            flattened = self.flattened_router_data(router_data)
+            serialized = json.dumps(json.dumps(flattened))
+            router_script = (
+                "<script>window.__reactRouterContext.streamController."
+                f"enqueue({serialized})</script>"
+            )
+
+        return f"""
+            <html><head>
+                <title>Test Organization</title>
+                <link rel="canonical" href="{canonical_url}">
+            </head><body>
+                <div data-testid="page_community_profile">
+                    <div data-testid="profile-header">
+                        <h1>Test Organization</h1>
+                    </div>
+                </div>
+                {router_script}
+            </body></html>
+        """
+
+    def test_dockerhub_certain_found(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html()))[1],
+            FOUND,
+        )
+
+    def test_dockerhub_canonical_conflict_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                self.profile_html(canonical_username="Other_User"),
+            )
+        )
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_dockerhub_username_conflict_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                self.profile_html(public_username="Other_User"),
+            )
+        )
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_dockerhub_stable_id_conflict_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                self.profile_html(
+                    profile_uuid="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                ),
+            )
+        )
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_dockerhub_incomplete_data_is_possible(self):
+        result = self.check(
+            self.response(200, self.profile_html(include_router=False))
+        )
+        self.assertEqual(result[1], POSSIBLE)
+
+    def test_dockerhub_confirmed_404_is_not_found(self):
+        html = "<html><title>Page Not Found</title></html>"
+        self.assertEqual(self.check(self.response(404, html))[1], NOT_FOUND)
+
+    def test_dockerhub_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_dockerhub_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+
+class FiverrProfileDetectionTests(
+    PublicProfileCheckerMixin,
+    unittest.TestCase,
+):
+    site_name = "Fiverr"
+    default_url = "https://www.fiverr.com/Test_User"
+    site_config = {
+        "url": "https://www.fiverr.com/{username}",
+        "checker": "fiverr_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def profile_html(
+        self,
+        *,
+        canonical_username="Test_User",
+        public_username="Test_User",
+        seller_id="12345",
+        secondary_id="12345",
+        include_public_json=True,
+    ):
+        canonical_url = f"https://www.fiverr.com/{canonical_username}"
+        public_json = ""
+        if include_public_json:
+            data = {
+                "seller": {
+                    "user": {"id": seller_id, "name": public_username},
+                    "isActive": True,
+                },
+                "localizationData": {"user_id": secondary_id},
+                "reviewsData": {
+                    "buying_reviews": {"user_id": secondary_id},
+                    "selling_reviews": {"user_id": secondary_id},
+                },
+            }
+            public_json = (
+                '<script id="perseus-initial-props" '
+                f'type="application/json">{json.dumps(data)}</script>'
+            )
+        return f"""
+            <html><head>
+                <title>Test User | Profile | Fiverr</title>
+                <link rel="canonical" href="{canonical_url}">
+                <meta property="og:url" content="{canonical_url}">
+                <script type="application/ld+json">
+                {{
+                    "@context": "https://schema.org",
+                    "@type": "ProfilePage",
+                    "url": "https://www.fiverr.com/{public_username}",
+                    "mainEntity": {{
+                        "@type": "Person",
+                        "name": "Test User",
+                        "url": "https://www.fiverr.com/{public_username}"
+                    }}
+                }}
+                </script>
+                {public_json}
+            </head></html>
+        """
+
+    def test_fiverr_certain_found(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html()))[1],
+            FOUND,
+        )
+
+    def test_fiverr_canonical_conflict_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                self.profile_html(canonical_username="Other_User"),
+            )
+        )
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_fiverr_username_conflict_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                self.profile_html(public_username="Other_User"),
+            )
+        )
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_fiverr_stable_id_conflict_is_unknown(self):
+        result = self.check(
+            self.response(200, self.profile_html(secondary_id="98765"))
+        )
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_fiverr_incomplete_data_is_possible(self):
+        result = self.check(
+            self.response(
+                200,
+                self.profile_html(include_public_json=False),
+            )
+        )
+        self.assertEqual(result[1], POSSIBLE)
+
+    def test_fiverr_confirmed_404_is_not_found(self):
+        html = """
+            <html><head>
+                <title>Page not found - Fiverr</title>
+                <meta property="og:url" content="https://www.fiverr.com">
+            </head></html>
+        """
+        self.assertEqual(self.check(self.response(404, html))[1], NOT_FOUND)
+
+    def test_fiverr_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_fiverr_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+
+class BehanceProfileDetectionTests(
+    PublicProfileCheckerMixin,
+    unittest.TestCase,
+):
+    site_name = "Behance"
+    default_url = "https://www.behance.net/Test_User"
+    site_config = {
+        "url": "https://www.behance.net/{username}",
+        "checker": "behance_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def profile_html(
+        self,
+        *,
+        canonical_username="Test_User",
+        public_username="Test_User",
+        stable_id="12345",
+        schema_id="12345",
+        include_store=True,
+    ):
+        canonical_url = (
+            f"https://www.behance.net/{canonical_username}"
+        )
+        store_script = ""
+        if include_store:
+            store = {
+                "profile": {
+                    "user": {
+                        "id": int(stable_id),
+                        "username": public_username,
+                        "displayName": "Test User",
+                        "url": f"https://www.behance.net/{public_username}",
+                    },
+                },
+            }
+            store_script = (
+                '<script id="beconfig-store_state" '
+                f'type="application/json">{json.dumps(store)}</script>'
+            )
+        return f"""
+            <html><head>
+                <title>Test User - Designer :: Behance</title>
+                <link rel="canonical" href="{canonical_url}">
+                <script type="application/ld+json">
+                {{
+                    "@context": "http://schema.org",
+                    "@type": "Person",
+                    "name": "Test User",
+                    "identifier": {schema_id},
+                    "url": "https://www.behance.net/{public_username}"
+                }}
+                </script>
+                {store_script}
+            </head></html>
+        """
+
+    def test_behance_certain_found(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html()))[1],
+            FOUND,
+        )
+
+    def test_behance_canonical_conflict_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                self.profile_html(canonical_username="Other_User"),
+            )
+        )
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_behance_username_conflict_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                self.profile_html(public_username="Other_User"),
+            )
+        )
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_behance_stable_id_conflict_is_unknown(self):
+        result = self.check(
+            self.response(200, self.profile_html(schema_id="98765"))
+        )
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_behance_incomplete_data_is_possible(self):
+        result = self.check(
+            self.response(200, self.profile_html(include_store=False))
+        )
+        self.assertEqual(result[1], POSSIBLE)
+
+    def test_behance_confirmed_404_is_not_found(self):
+        html = (
+            "<html><title>Oops! We can’t find that page. :: "
+            "Behance</title></html>"
+        )
+        self.assertEqual(self.check(self.response(404, html))[1], NOT_FOUND)
+
+    def test_behance_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_behance_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+
+class VimeoProfileDetectionTests(
+    PublicProfileCheckerMixin,
+    unittest.TestCase,
+):
+    site_name = "Vimeo"
+    default_url = "https://vimeo.com/Test_User"
+    site_config = {
+        "url": "https://vimeo.com/{username}",
+        "checker": "vimeo_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def profile_html(
+        self,
+        *,
+        public_username="Test_User",
+        stable_id="12345",
+        schema_id="12345",
+        canonical_username=None,
+        include_schema=True,
+    ):
+        canonical_username = canonical_username or public_username
+        canonical_url = f"https://vimeo.com/{canonical_username}"
+        schema = {}
+        if include_schema:
+            schema = {
+                "@context": "http://schema.org",
+                "@graph": [{
+                    "@type": "ProfilePage",
+                    "url": canonical_url,
+                    "mainEntity": {
+                        "@type": "Person",
+                        "name": "Test User",
+                        "identifier": int(schema_id),
+                        "alternateName": public_username,
+                        "url": f"/{public_username}",
+                        "sameAs": [f"https://vimeo.com/{public_username}"],
+                    },
+                }],
+            }
+        next_data = {
+            "props": {
+                "pageProps": {
+                    "userId": public_username,
+                    "numericUserId": int(stable_id),
+                    "profileMeta": {
+                        "title": "Test User",
+                        "canonical": canonical_url,
+                        "crawlable": {
+                            "pageUrl": canonical_url,
+                            "name": "Test User",
+                            "userId": int(stable_id),
+                            "jsonLd": json.dumps(schema),
+                        },
+                    },
+                },
+            },
+            "page": "/profile/[userId]",
+            "query": {"userId": public_username},
+        }
+        return f"""
+            <html><head>
+                <title>Test User</title>
+                <link rel="canonical" href="{canonical_url}">
+                <meta property="og:url" content="{canonical_url}">
+                <script id="__NEXT_DATA__" type="application/json">{json.dumps(next_data)}</script>
+            </head></html>
+        """
+
+    def test_vimeo_certain_found(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html()))[1],
+            FOUND,
+        )
+
+    def test_vimeo_numeric_alias_is_confirmed_by_stable_id(self):
+        self.username = "user12345"
+        self.default_url = "https://vimeo.com/CurrentVanity"
+        result = self.check(
+            self.response(
+                200,
+                self.profile_html(public_username="CurrentVanity"),
+            )
+        )
+        self.assertEqual(result[1], FOUND)
+        self.assertEqual(result[2], "https://vimeo.com/CurrentVanity")
+
+    def test_vimeo_unconfirmed_vanity_redirect_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                self.profile_html(public_username="Other_User"),
+                url="https://vimeo.com/Other_User",
+            )
+        )
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_vimeo_url_conflict_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                self.profile_html(canonical_username="Other_User"),
+            )
+        )
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_vimeo_stable_id_conflict_is_unknown(self):
+        result = self.check(
+            self.response(200, self.profile_html(schema_id="98765"))
+        )
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_vimeo_incomplete_data_is_possible(self):
+        result = self.check(
+            self.response(200, self.profile_html(include_schema=False))
+        )
+        self.assertEqual(result[1], POSSIBLE)
+
+    def test_vimeo_confirmed_404_is_not_found(self):
+        html = """
+            <html><head><title>Vimeo</title>
+            <script id="__NEXT_DATA__" type="application/json">
+                {"props": {}, "page": "/404"}
+            </script></head></html>
+        """
+        self.assertEqual(self.check(self.response(404, html))[1], NOT_FOUND)
+
+    def test_vimeo_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_vimeo_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+
+class NewPublicProfileCheckerConfigTests(unittest.TestCase):
+    def test_five_services_use_dedicated_checkers(self):
+        config = load_sites_config()
+        expected = {
+            "GitLab": "gitlab_profile",
+            "Docker Hub": "dockerhub_profile",
+            "Fiverr": "fiverr_profile",
+            "Behance": "behance_profile",
+            "Vimeo": "vimeo_profile",
+        }
+
+        for service_name, checker in expected.items():
+            with self.subTest(service=service_name):
+                self.assertEqual(config[service_name]["checker"], checker)
+
+
 if __name__ == "__main__":
     unittest.main()

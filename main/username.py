@@ -4050,6 +4050,852 @@ def classify_snapchat_profile_response(username, response, profile_url):
 
 
 # ============================================================
+# SPECJALNA DETEKCJA PROFILI GITLAB
+# ============================================================
+
+def _gitlab_profile_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        ("gitlab.com", "www.gitlab.com"),
+        f"/{username}",
+    )
+
+
+def classify_gitlab_profile_response(username, response, profile_url):
+    status_code = response.status_code
+    final_path = unquote(urlparse(response.url or "").path).casefold()
+
+    if (
+        final_path.startswith("/users/sign_in")
+        or final_path.startswith("/users/sign_in/")
+    ):
+        return BLOCKED, None, "GitLab sign-in or challenge redirect"
+
+    transport_result = _public_profile_transport_result(response, "GitLab")
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    canonical_url = _public_profile_canonical(soup)
+    og_url = _public_profile_meta(soup, "property", "og:url")
+    og_type = _public_profile_meta(soup, "property", "og:type")
+    expected_username = username.casefold()
+
+    final_matches = _gitlab_profile_url_matches(response.url, username)
+    canonical_matches = _gitlab_profile_url_matches(
+        canonical_url,
+        username,
+    )
+    og_url_matches = _gitlab_profile_url_matches(og_url, username)
+
+    profile_body = soup.find("body", attrs={"data-page": "users:show"})
+    profile_header = soup.find(
+        attrs={"data-testid": "user-profile-header"}
+    )
+    action_nodes = soup.select(
+        ".js-user-profile-actions[data-user-id][data-rss-subscription-path]"
+    )
+    achievement_nodes = soup.select("#js-user-achievements[data-user-id]")
+
+    stable_ids = {
+        node.get("data-user-id", "")
+        for node in (*action_nodes, *achievement_nodes)
+        if node.get("data-user-id")
+    }
+    rss_usernames = set()
+    for node in action_nodes:
+        rss_path = unquote(node.get("data-rss-subscription-path", ""))
+        match = re.fullmatch(r"/([^/]+)\.atom", rss_path)
+        if match:
+            rss_usernames.add(match.group(1).casefold())
+
+    breadcrumb_urls = set()
+    for document in _public_json_ld_documents(soup):
+        if not isinstance(document, dict):
+            continue
+        if document.get("@type") != "BreadcrumbList":
+            continue
+        for item in document.get("itemListElement", []):
+            if isinstance(item, dict) and isinstance(item.get("item"), str):
+                breadcrumb_urls.add(item["item"])
+
+    conflicts = (
+        bool(response.url and not final_matches),
+        bool(canonical_url and not canonical_matches),
+        bool(og_url and not og_url_matches),
+        bool(rss_usernames and rss_usernames != {expected_username}),
+        len(stable_ids) > 1,
+        any(not value.isdigit() for value in stable_ids),
+        any(
+            not _gitlab_profile_url_matches(value, username)
+            for value in breadcrumb_urls
+        ),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "GitLab profile evidence conflict"
+
+    if status_code >= 400:
+        return (
+            UNKNOWN,
+            None,
+            f"unconfirmed GitLab HTTP {status_code}; "
+            "profile existence unknown",
+        )
+
+    if status_code != 200 or not final_matches:
+        return UNKNOWN, None, "unexpected GitLab final URL"
+
+    if (
+        og_url_matches
+        and og_type.casefold() == "object"
+        and title.casefold().endswith(" · gitlab")
+        and profile_body is not None
+        and profile_header is not None
+        and rss_usernames == {expected_username}
+        and len(stable_ids) == 1
+        and len(action_nodes) == 1
+        and len(achievement_nodes) == 1
+        and len(breadcrumb_urls) == 1
+    ):
+        return (
+            FOUND,
+            profile_url,
+            "public GitLab profile found; identity not verified",
+        )
+
+    return (
+        POSSIBLE,
+        profile_url,
+        "incomplete GitLab public profile evidence",
+    )
+
+
+# ============================================================
+# SPECJALNA DETEKCJA NAMESPACE DOCKER HUB
+# ============================================================
+
+def _dockerhub_profile_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        ("hub.docker.com",),
+        f"/u/{username}",
+    )
+
+
+def _deserialize_router_data(flattened):
+    if not isinstance(flattened, list) or not flattened:
+        return None
+
+    memo = {}
+    resolving = set()
+
+    def resolve(index):
+        if isinstance(index, bool):
+            return index
+        if not isinstance(index, int):
+            return index
+        if index < 0 or index >= len(flattened):
+            return None
+        if index in memo:
+            return memo[index]
+        if index in resolving:
+            return None
+
+        resolving.add(index)
+        value = flattened[index]
+
+        if isinstance(value, dict):
+            result = {}
+            memo[index] = result
+            for encoded_key, encoded_value in value.items():
+                if not re.fullmatch(r"_\d+", encoded_key):
+                    continue
+                key = resolve(int(encoded_key[1:]))
+                if isinstance(key, str):
+                    result[key] = resolve(encoded_value)
+        elif isinstance(value, list):
+            result = [resolve(item) for item in value]
+            memo[index] = result
+        else:
+            result = value
+            memo[index] = result
+
+        resolving.discard(index)
+        return result
+
+    return resolve(0)
+
+
+def _dockerhub_router_data(soup):
+    pattern = re.compile(
+        r"streamController\.enqueue\("
+        r"(\"(?:\\.|[^\"\\])*\")\)",
+        re.DOTALL,
+    )
+
+    for node in soup.find_all("script"):
+        script = node.string or node.get_text()
+        if "streamController.enqueue" not in script:
+            continue
+
+        for match in pattern.finditer(script):
+            try:
+                serialized = json.loads(match.group(1))
+                flattened = json.loads(serialized)
+            except (TypeError, json.JSONDecodeError):
+                continue
+
+            value = _deserialize_router_data(flattened)
+            if isinstance(value, dict):
+                return value
+
+    return {}
+
+
+def classify_dockerhub_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(
+        response,
+        "Docker Hub",
+    )
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    canonical_url = _public_profile_canonical(soup)
+    expected_username = username.casefold()
+    final_matches = _dockerhub_profile_url_matches(response.url, username)
+    canonical_matches = _dockerhub_profile_url_matches(
+        canonical_url,
+        username,
+    )
+
+    router_data = _dockerhub_router_data(soup)
+    namespace_data = (
+        router_data.get("loaderData", {}).get(
+            "routes/_layout.u.$namespace",
+            {},
+        )
+        if isinstance(router_data, dict)
+        else {}
+    )
+    if not isinstance(namespace_data, dict):
+        namespace_data = {}
+    public_profile = namespace_data.get("profile", {})
+    if not isinstance(public_profile, dict):
+        public_profile = {}
+
+    public_username = str(
+        public_profile.get("orgname")
+        or public_profile.get("username")
+        or ""
+    ).casefold()
+    stable_id = str(public_profile.get("id", ""))
+    stable_uuid = str(public_profile.get("uuid", ""))
+    profile_type = str(public_profile.get("type", "")).casefold()
+    router_canonical = str(namespace_data.get("canonicalUrl", ""))
+
+    compact_uuid = stable_uuid.replace("-", "").casefold()
+    stable_id_valid = bool(
+        re.fullmatch(r"[0-9a-f]{32}", stable_id, re.IGNORECASE)
+        and re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+            r"[0-9a-f]{4}-[0-9a-f]{12}",
+            stable_uuid,
+            re.IGNORECASE,
+        )
+        and stable_id.casefold() == compact_uuid
+    )
+
+    profile_page_marker = soup.find(
+        attrs={"data-testid": "page_community_profile"}
+    )
+    profile_header_marker = soup.find(
+        attrs={"data-testid": "profile-header"}
+    )
+    profile_heading = soup.find("h1")
+
+    conflicts = (
+        bool(response.url and not final_matches),
+        bool(canonical_url and not canonical_matches),
+        bool(router_canonical and not _dockerhub_profile_url_matches(
+            router_canonical,
+            username,
+        )),
+        bool(public_username and public_username != expected_username),
+        bool((stable_id or stable_uuid) and not stable_id_valid),
+        bool(profile_type and profile_type not in ("user", "organization")),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "Docker Hub namespace evidence conflict"
+
+    profile_evidence = any((
+        canonical_url,
+        public_profile,
+        profile_page_marker,
+        profile_header_marker,
+    ))
+    if (
+        response.status_code == 404
+        and final_matches
+        and title.casefold() == "page not found"
+        and not profile_evidence
+    ):
+        return NOT_FOUND, None, "public Docker Hub namespace not found"
+
+    if response.status_code >= 400:
+        return (
+            UNKNOWN,
+            None,
+            f"unconfirmed Docker Hub HTTP {response.status_code}",
+        )
+
+    if response.status_code != 200 or not final_matches:
+        return UNKNOWN, None, "unexpected Docker Hub final URL"
+
+    if (
+        canonical_matches
+        and _dockerhub_profile_url_matches(router_canonical, username)
+        and public_username == expected_username
+        and stable_id_valid
+        and profile_type in ("user", "organization")
+        and title
+        and title.casefold() != "page not found"
+        and profile_page_marker is not None
+        and profile_header_marker is not None
+        and profile_heading is not None
+        and profile_heading.get_text(" ", strip=True)
+    ):
+        return (
+            FOUND,
+            profile_url,
+            "public Docker Hub namespace found; identity not verified",
+        )
+
+    return (
+        POSSIBLE,
+        profile_url,
+        "incomplete Docker Hub public namespace evidence",
+    )
+
+
+# ============================================================
+# SPECJALNA DETEKCJA PROFILI FIVERR
+# ============================================================
+
+def _fiverr_profile_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        ("fiverr.com", "www.fiverr.com"),
+        f"/{username}",
+    )
+
+
+def _json_script_by_id(soup, script_id):
+    node = soup.select_one(f"script#{script_id}")
+    if not node:
+        return {}
+
+    try:
+        value = json.loads(node.string or node.get_text())
+    except (TypeError, json.JSONDecodeError):
+        return {}
+
+    return value if isinstance(value, dict) else {}
+
+
+def classify_fiverr_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(response, "Fiverr")
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    canonical_url = _public_profile_canonical(soup)
+    og_url = _public_profile_meta(soup, "property", "og:url")
+    expected_username = username.casefold()
+
+    final_matches = _fiverr_profile_url_matches(response.url, username)
+    canonical_matches = _fiverr_profile_url_matches(canonical_url, username)
+    og_url_matches = _fiverr_profile_url_matches(og_url, username)
+    parsed_og_url = urlparse(og_url)
+    generic_not_found_og = bool(
+        response.status_code == 404
+        and parsed_og_url.netloc.casefold()
+        in ("fiverr.com", "www.fiverr.com")
+        and not unquote(parsed_og_url.path).strip("/")
+    )
+
+    profile_pages = [
+        document
+        for document in _public_json_ld_documents(soup)
+        if isinstance(document, dict)
+        and document.get("@type") == "ProfilePage"
+    ]
+    profile_entities = [
+        page.get("mainEntity")
+        for page in profile_pages
+        if isinstance(page.get("mainEntity"), dict)
+        and page["mainEntity"].get("@type") == "Person"
+    ]
+    schema_urls = {
+        value
+        for page in profile_pages
+        for value in (page.get("url"),)
+        if isinstance(value, str) and value
+    }
+    schema_urls.update(
+        entity.get("url")
+        for entity in profile_entities
+        if isinstance(entity.get("url"), str) and entity.get("url")
+    )
+
+    public_data = _json_script_by_id(soup, "perseus-initial-props")
+    seller = public_data.get("seller", {})
+    if not isinstance(seller, dict):
+        seller = {}
+    seller_user = seller.get("user", {})
+    if not isinstance(seller_user, dict):
+        seller_user = {}
+
+    public_username = str(seller_user.get("name", "")).casefold()
+    stable_ids = {
+        str(value)
+        for value in (
+            seller_user.get("id"),
+            public_data.get("localizationData", {}).get("user_id"),
+            public_data.get("reviewsData", {}).get(
+                "buying_reviews",
+                {},
+            ).get("user_id"),
+            public_data.get("reviewsData", {}).get(
+                "selling_reviews",
+                {},
+            ).get("user_id"),
+        )
+        if value not in (None, "")
+    }
+    stable_id_conflict = (
+        len(stable_ids) > 1
+        or any(not value.isdigit() for value in stable_ids)
+    )
+
+    conflicts = (
+        bool(response.url and not final_matches),
+        bool(canonical_url and not canonical_matches),
+        bool(og_url and not og_url_matches and not generic_not_found_og),
+        bool(public_username and public_username != expected_username),
+        any(
+            not _fiverr_profile_url_matches(value, username)
+            for value in schema_urls
+        ),
+        stable_id_conflict,
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "Fiverr profile evidence conflict"
+
+    profile_evidence = any((
+        canonical_url,
+        profile_pages,
+        seller_user,
+    ))
+    if (
+        response.status_code == 404
+        and final_matches
+        and title.casefold() == "page not found - fiverr"
+        and not profile_evidence
+    ):
+        return NOT_FOUND, None, "public Fiverr profile not found"
+
+    if response.status_code >= 400:
+        return UNKNOWN, None, f"unconfirmed Fiverr HTTP {response.status_code}"
+
+    if response.status_code != 200 or not final_matches:
+        return UNKNOWN, None, "unexpected Fiverr final URL"
+
+    if (
+        canonical_matches
+        and og_url_matches
+        and title.casefold().endswith("| profile | fiverr")
+        and len(profile_pages) == 1
+        and len(profile_entities) == 1
+        and schema_urls
+        and public_username == expected_username
+        and len(stable_ids) == 1
+        and seller.get("isActive") is True
+    ):
+        return (
+            FOUND,
+            profile_url,
+            "public Fiverr profile found; identity not verified",
+        )
+
+    return (
+        POSSIBLE,
+        profile_url,
+        "incomplete Fiverr public profile evidence",
+    )
+
+
+# ============================================================
+# SPECJALNA DETEKCJA PROFILI BEHANCE
+# ============================================================
+
+def _behance_profile_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        ("behance.net", "www.behance.net"),
+        f"/{username}",
+    )
+
+
+def _behance_primary_profile(store_data):
+    profile_state = store_data.get("profile", {})
+    if isinstance(profile_state, dict):
+        user = profile_state.get("user")
+        if isinstance(user, dict):
+            return user
+
+    team_state = store_data.get("team", {})
+    if isinstance(team_state, dict):
+        team_profile = team_state.get("profile")
+        if isinstance(team_profile, dict):
+            return team_profile
+
+    return {}
+
+
+def classify_behance_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(response, "Behance")
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    canonical_url = _public_profile_canonical(soup)
+    expected_username = username.casefold()
+    final_matches = _behance_profile_url_matches(response.url, username)
+    canonical_matches = _behance_profile_url_matches(
+        canonical_url,
+        username,
+    )
+
+    store_data = _json_script_by_id(soup, "beconfig-store_state")
+    public_profile = _behance_primary_profile(store_data)
+    public_username = str(public_profile.get("username", "")).casefold()
+    public_url = str(public_profile.get("url", ""))
+    if public_url.startswith("/"):
+        public_url = urljoin("https://www.behance.net", public_url)
+    stable_id = str(public_profile.get("id", ""))
+
+    schema_people = [
+        document
+        for document in _public_json_ld_documents(soup)
+        if isinstance(document, dict) and document.get("@type") == "Person"
+    ]
+    schema_urls = {
+        item.get("url")
+        for item in schema_people
+        if isinstance(item.get("url"), str) and item.get("url")
+    }
+    schema_ids = {
+        str(item.get("identifier"))
+        for item in schema_people
+        if item.get("identifier") not in (None, "")
+    }
+
+    username_confirmed = (
+        public_username == expected_username
+        or _behance_profile_url_matches(public_url, username)
+    )
+    stable_ids = {
+        value
+        for value in (stable_id, *schema_ids)
+        if value
+    }
+    stable_id_conflict = (
+        len(stable_ids) > 1
+        or any(not value.isdigit() for value in stable_ids)
+    )
+
+    conflicts = (
+        bool(response.url and not final_matches),
+        bool(canonical_url and not canonical_matches),
+        bool(public_username and public_username != expected_username),
+        bool(public_url and not _behance_profile_url_matches(
+            public_url,
+            username,
+        )),
+        any(
+            not _behance_profile_url_matches(value, username)
+            for value in schema_urls
+        ),
+        stable_id_conflict,
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "Behance profile evidence conflict"
+
+    profile_evidence = any((
+        canonical_url,
+        public_profile,
+        schema_people,
+    ))
+    if (
+        response.status_code == 404
+        and final_matches
+        and "oops! we can’t find that page." in title.casefold()
+        and not profile_evidence
+    ):
+        return NOT_FOUND, None, "public Behance profile not found"
+
+    if response.status_code >= 400:
+        return UNKNOWN, None, f"unconfirmed Behance HTTP {response.status_code}"
+
+    if response.status_code != 200 or not final_matches:
+        return UNKNOWN, None, "unexpected Behance final URL"
+
+    if (
+        canonical_matches
+        and title.casefold().endswith(":: behance")
+        and username_confirmed
+        and bool(public_profile.get("display_name") or public_profile.get(
+            "displayName"
+        ))
+        and len(stable_ids) == 1
+    ):
+        return (
+            FOUND,
+            profile_url,
+            "public Behance profile found; identity not verified",
+        )
+
+    return (
+        POSSIBLE,
+        profile_url,
+        "incomplete Behance public profile evidence",
+    )
+
+
+# ============================================================
+# SPECJALNA DETEKCJA PROFILI VIMEO
+# ============================================================
+
+def _vimeo_profile_url_slug(value):
+    if not isinstance(value, str) or not value:
+        return None
+
+    parsed = urlparse(value)
+    if (
+        parsed.scheme not in ("http", "https")
+        or parsed.netloc.casefold() not in ("vimeo.com", "www.vimeo.com")
+    ):
+        return None
+
+    path_parts = [part for part in unquote(parsed.path).split("/") if part]
+    if len(path_parts) != 1:
+        return None
+
+    return path_parts[0].casefold()
+
+
+def _vimeo_reference_slug(value):
+    if not isinstance(value, str) or not value:
+        return None
+
+    if value.startswith("/"):
+        path_parts = [part for part in unquote(value).split("/") if part]
+        return path_parts[0].casefold() if len(path_parts) == 1 else None
+
+    return _vimeo_profile_url_slug(value)
+
+
+def classify_vimeo_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(response, "Vimeo")
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    canonical_url = _public_profile_canonical(soup)
+    og_url = _public_profile_meta(soup, "property", "og:url")
+    expected_username = username.casefold()
+
+    final_slug = _vimeo_profile_url_slug(response.url)
+    canonical_slug = _vimeo_profile_url_slug(canonical_url)
+    og_slug = _vimeo_profile_url_slug(og_url)
+
+    next_data = _json_script_by_id(soup, "__NEXT_DATA__")
+    page_props = next_data.get("props", {}).get("pageProps", {})
+    if not isinstance(page_props, dict):
+        page_props = {}
+    public_slug = str(page_props.get("userId", "")).casefold()
+    numeric_user_id = str(page_props.get("numericUserId", ""))
+    profile_meta = page_props.get("profileMeta", {})
+    if not isinstance(profile_meta, dict):
+        profile_meta = {}
+    crawlable = profile_meta.get("crawlable", {})
+    if not isinstance(crawlable, dict):
+        crawlable = {}
+
+    embedded_schema = {}
+    serialized_schema = crawlable.get("jsonLd")
+    if isinstance(serialized_schema, str):
+        try:
+            embedded_schema = json.loads(serialized_schema)
+        except json.JSONDecodeError:
+            embedded_schema = {}
+
+    profile_pages = [
+        item
+        for item in _walk_public_json(embedded_schema)
+        if item.get("@type") == "ProfilePage"
+    ]
+    profile_entities = [
+        item.get("mainEntity")
+        for item in profile_pages
+        if isinstance(item.get("mainEntity"), dict)
+        and item["mainEntity"].get("@type") == "Person"
+    ]
+
+    schema_slugs = {
+        slug
+        for item in profile_entities
+        for value in (
+            item.get("url"),
+            *(item.get("sameAs", []) if isinstance(
+                item.get("sameAs"),
+                list,
+            ) else []),
+        )
+        for slug in (_vimeo_reference_slug(value),)
+        if slug
+    }
+    schema_usernames = {
+        str(item.get("alternateName", "")).casefold()
+        for item in profile_entities
+        if item.get("alternateName")
+    }
+    schema_ids = {
+        str(item.get("identifier"))
+        for item in profile_entities
+        if item.get("identifier") not in (None, "")
+    }
+    crawlable_ids = {
+        str(value)
+        for value in (crawlable.get("userId"), numeric_user_id)
+        if value not in (None, "")
+    }
+    stable_ids = schema_ids | crawlable_ids
+
+    numeric_alias_match = bool(
+        numeric_user_id.isdigit()
+        and expected_username == f"user{numeric_user_id}".casefold()
+    )
+    direct_slug_match = bool(
+        public_slug and public_slug == expected_username
+    )
+    alias_confirmed = direct_slug_match or numeric_alias_match
+
+    meta_canonical_slug = _vimeo_profile_url_slug(
+        str(profile_meta.get("canonical", ""))
+    )
+    crawlable_page_slug = _vimeo_profile_url_slug(
+        str(crawlable.get("pageUrl", ""))
+    )
+    current_slugs = {
+        value
+        for value in (
+            final_slug,
+            canonical_slug,
+            og_slug,
+            meta_canonical_slug,
+            crawlable_page_slug,
+            public_slug,
+        )
+        if value
+    }
+
+    stable_id_conflict = (
+        len(stable_ids) > 1
+        or any(not value.isdigit() for value in stable_ids)
+    )
+    current_slug_conflict = bool(
+        public_slug and current_slugs != {public_slug}
+    )
+    schema_slug_conflict = bool(
+        schema_slugs and schema_slugs != {public_slug}
+    )
+    schema_username_conflict = bool(
+        schema_usernames and schema_usernames != {public_slug}
+    )
+
+    if any((
+        stable_id_conflict,
+        current_slug_conflict,
+        schema_slug_conflict,
+        schema_username_conflict,
+    )):
+        return UNKNOWN, None, "Vimeo profile evidence conflict"
+
+    profile_evidence = any((
+        canonical_url,
+        og_url,
+        profile_meta,
+        profile_pages,
+        numeric_user_id,
+    ))
+    if (
+        response.status_code == 404
+        and final_slug == expected_username
+        and title.casefold() == "vimeo"
+        and not profile_evidence
+    ):
+        return NOT_FOUND, None, "public Vimeo profile not found"
+
+    if response.status_code >= 400:
+        return UNKNOWN, None, f"unconfirmed Vimeo HTTP {response.status_code}"
+
+    if response.status_code != 200:
+        return UNKNOWN, None, "unexpected Vimeo response"
+
+    if not alias_confirmed:
+        return (
+            UNKNOWN,
+            None,
+            "Vimeo vanity redirect is not linked to the requested username",
+        )
+
+    title_matches = bool(
+        title
+        and profile_meta.get("title")
+        and title == profile_meta.get("title")
+    )
+    if (
+        len(current_slugs) == 1
+        and current_slugs == {public_slug}
+        and title_matches
+        and len(stable_ids) == 1
+        and len(profile_pages) == 1
+        and len(profile_entities) == 1
+        and schema_usernames == {public_slug}
+        and schema_slugs == {public_slug}
+    ):
+        link = response.url if numeric_alias_match else profile_url
+        return (
+            FOUND,
+            link,
+            "public Vimeo profile found; identity not verified",
+        )
+
+    return (
+        POSSIBLE,
+        profile_url,
+        "incomplete Vimeo public profile evidence",
+    )
+
+
+# ============================================================
 # SPRAWDZANIE JEDNEGO SERWISU
 # ============================================================
 
@@ -4299,6 +5145,51 @@ def check_username_on_site(username, site_name, site_config):
 
         if checker == "snapchat_profile":
             status, link, info = classify_snapchat_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "gitlab_profile":
+            status, link, info = classify_gitlab_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "dockerhub_profile":
+            status, link, info = classify_dockerhub_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "fiverr_profile":
+            status, link, info = classify_fiverr_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "behance_profile":
+            status, link, info = classify_behance_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "vimeo_profile":
+            status, link, info = classify_vimeo_profile_response(
                 username,
                 response,
                 url,

@@ -353,6 +353,7 @@
   },
   "Fiverr": {
     "url": "https://www.fiverr.com/{username}",
+    "checker": "fiverr_profile",
     "detect_based_on_message": false,
     "not_found_status_codes": [404],
     "not_found_message": "We can't find that page",
@@ -524,6 +525,7 @@
   },
   "Behance": {
     "url": "https://www.behance.net/{username}",
+    "checker": "behance_profile",
     "detect_based_on_message": true,
     "not_found_status_codes": [404],
     "not_found_message": "Oops! We can’t find that page.",
@@ -771,6 +773,7 @@
   },
   "Vimeo": {
     "url": "https://vimeo.com/{username}",
+    "checker": "vimeo_profile",
     "detect_based_on_message": true,
     "not_found_status_codes": [404],
     "not_found_message": "Page Not Found",
@@ -839,6 +842,7 @@
   },
   "GitLab": {
     "url": "https://gitlab.com/{username}",
+    "checker": "gitlab_profile",
     "detect_based_on_message": true,
     "not_found_status_codes": [404],
     "not_found_message": "Page Not Found",
@@ -2033,6 +2037,7 @@
   },
   "Docker Hub": {
     "url": "https://hub.docker.com/u/{username}",
+    "checker": "dockerhub_profile",
     "detect_based_on_message": true,
     "not_found_status_codes": [404],
     "not_found_message": "Page Not Found",
