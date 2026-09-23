@@ -13,8 +13,116 @@ from main.username import (
     RATE_LIMIT,
     UNKNOWN,
     check_username_on_site,
+    generate_username_candidates,
     load_sites_config,
+    main as username_main,
 )
+
+
+class UsernameCandidateGenerationTests(unittest.TestCase):
+    def test_two_part_display_name(self):
+        self.assertEqual(
+            generate_username_candidates("Jan Kowalski"),
+            [
+                "jan kowalski",
+                "jankowalski",
+                "jan.kowalski",
+                "jan_kowalski",
+                "jan-kowalski",
+                "kowalski.jan",
+                "kowalski_jan",
+                "kowalski-jan",
+                "kowalskijan",
+            ],
+        )
+
+    def test_three_part_display_name(self):
+        self.assertEqual(
+            generate_username_candidates("Jan Adam Kowalski"),
+            [
+                "jan adam kowalski",
+                "janadamkowalski",
+                "jan.adam.kowalski",
+                "jan_adam_kowalski",
+                "jan-adam-kowalski",
+                "kowalski.adam.jan",
+                "kowalski_adam_jan",
+                "kowalski-adam-jan",
+                "kowalskiadamjan",
+            ],
+        )
+
+    def test_repeated_whitespace_is_normalized(self):
+        self.assertEqual(
+            generate_username_candidates("  Jan   Kowalski  "),
+            generate_username_candidates("Jan Kowalski"),
+        )
+
+    def test_display_name_is_casefolded(self):
+        self.assertEqual(
+            generate_username_candidates("jAn KoWaLsKi"),
+            generate_username_candidates("JAN KOWALSKI"),
+        )
+
+    def test_polish_unicode_is_preserved(self):
+        candidates = generate_username_candidates("Łukasz Żółć")
+
+        self.assertEqual(candidates[0], "łukasz żółć")
+        self.assertIn("łukasz.żółć", candidates)
+        self.assertIn("żółć_łukasz", candidates)
+        self.assertNotIn("lukasz.zolc", candidates)
+
+    def test_candidates_do_not_contain_duplicates(self):
+        candidates = generate_username_candidates("Anna Anna")
+
+        self.assertEqual(len(candidates), len(set(candidates)))
+        self.assertEqual(len(candidates), 5)
+
+    def test_single_username_is_not_changed(self):
+        self.assertEqual(
+            generate_username_candidates("Wscieklosc666"),
+            ["Wscieklosc666"],
+        )
+
+    def test_empty_input_has_no_candidates(self):
+        self.assertEqual(generate_username_candidates(""), [])
+        self.assertEqual(generate_username_candidates("   \t\n"), [])
+
+    def test_existing_hyphen_underscore_and_dot_are_preserved(self):
+        candidates = generate_username_candidates("Anna-Maria Nowak_Smith")
+
+        self.assertIn("anna-maria.nowak_smith", candidates)
+        self.assertIn("nowak_smith-anna-maria", candidates)
+        self.assertEqual(
+            generate_username_candidates("Anna.Maria_Nowak-Smith"),
+            ["Anna.Maria_Nowak-Smith"],
+        )
+
+    def test_display_name_candidates_use_normal_site_checker(self):
+        site_config = {"url": "https://example.test/{username}"}
+
+        with (
+            patch("builtins.input", return_value="Jan Kowalski"),
+            patch(
+                "main.username.load_sites_config",
+                return_value={"Example": site_config},
+            ),
+            patch(
+                "main.username.check_username_on_site",
+                return_value=("Example", NOT_FOUND, None, "HTTP 404"),
+            ) as check_mock,
+            patch("main.username.print"),
+        ):
+            username_main()
+
+        checked_candidates = [
+            invocation.args[0]
+            for invocation in check_mock.call_args_list
+        ]
+        self.assertCountEqual(
+            checked_candidates,
+            generate_username_candidates("Jan Kowalski"),
+        )
 
 
 class CheckUsernameOnSiteTests(unittest.TestCase):

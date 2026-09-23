@@ -28,6 +28,37 @@ ERROR = "ERROR"
 
 
 # ============================================================
+# KANDYDACI USERNAME Z DISPLAY NAME
+# ============================================================
+
+def generate_username_candidates(name):
+    """Return a small, deterministic set of username candidates."""
+    normalized = " ".join(name.split())
+
+    if not normalized:
+        return []
+
+    parts = normalized.split(" ")
+    if len(parts) == 1:
+        return [normalized]
+
+    normalized_parts = [part.casefold() for part in parts]
+    reversed_parts = list(reversed(normalized_parts))
+
+    candidates = [" ".join(normalized_parts)]
+    candidates.extend(
+        separator.join(normalized_parts)
+        for separator in ("", ".", "_", "-")
+    )
+    candidates.extend(
+        separator.join(reversed_parts)
+        for separator in (".", "_", "-", "")
+    )
+
+    return list(dict.fromkeys(candidates))
+
+
+# ============================================================
 # WCZYTYWANIE KONFIGURACJI SERWISOW
 # ============================================================
 
@@ -6009,17 +6040,20 @@ def run_extra_lookup(site_name, username):
 
 def main():
     print(
-        "[magenta]Enter username to search[/magenta]: ",
+        "[magenta]Enter username or display name to search[/magenta]: ",
         end=""
     )
 
-    username = input().strip()
+    query = input().strip()
 
-    if not username:
-        print("[red][!][/red] Username cannot be empty.")
+    username_candidates = generate_username_candidates(query)
+
+    if not username_candidates:
+        print("[red][!][/red] Username or display name cannot be empty.")
         return
 
     sites = load_sites_config()
+    display_name_mode = len(username_candidates) > 1
 
     counters = {
         FOUND: 0,
@@ -6033,27 +6067,38 @@ def main():
 
     unknown_sites = []
 
+    if display_name_mode:
+        print(
+            "\n[cyan]Display name detected. Username candidates:[/cyan]"
+        )
+        print(", ".join(username_candidates))
+
+    total_checks = len(sites) * len(username_candidates)
     print(
-        f"\n[cyan]Scanning {len(sites)} services "
-        f"for username:[/cyan] {username}\n"
+        f"\n[cyan]Scanning {total_checks} service/candidate "
+        f"combinations[/cyan]\n"
     )
 
     with ThreadPoolExecutor(max_workers=10) as executor:
 
-        futures = [
+        futures = {
             executor.submit(
                 check_username_on_site,
-                username,
+                username_candidate,
                 site_name,
                 site_config,
-            )
-            for site_name, site_config
-            in sites.items()
-        ]
+            ): username_candidate
+            for username_candidate in username_candidates
+            for site_name, site_config in sites.items()
+        }
 
         for future in as_completed(futures):
 
+            username_candidate = futures[future]
             site_name, status, link, info = future.result()
+            result_label = site_name
+            if display_name_mode:
+                result_label = f"{site_name} [{username_candidate}]"
 
             counters[status] += 1
 
@@ -6065,7 +6110,7 @@ def main():
 
                 print(
                     f"[bold green][+][/bold green] "
-                    f"{site_name}: FOUND"
+                    f"{result_label}: FOUND"
                 )
 
                 print(
@@ -6074,7 +6119,7 @@ def main():
 
                 run_extra_lookup(
                     site_name,
-                    username
+                    username_candidate
                 )
 
             # ------------------------------------------------
@@ -6085,7 +6130,7 @@ def main():
 
                 print(
                     f"[cyan][?][/cyan] "
-                    f"{site_name}: POSSIBLE"
+                    f"{result_label}: POSSIBLE"
                 )
 
                 print(
@@ -6100,7 +6145,7 @@ def main():
 
                 print(
                     f"[yellow][🔒][/yellow] "
-                    f"{site_name}: BLOCKED / LOGIN "
+                    f"{result_label}: BLOCKED / LOGIN "
                     f"({info})"
                 )
 
@@ -6112,7 +6157,7 @@ def main():
 
                 print(
                     f"[magenta][!][/magenta] "
-                    f"{site_name}: RATE LIMIT "
+                    f"{result_label}: RATE LIMIT "
                     f"({info})"
                 )
 
@@ -6124,7 +6169,7 @@ def main():
 
                 print(
                     f"[red][!][/red] "
-                    f"{site_name}: ERROR "
+                    f"{result_label}: ERROR "
                     f"({info})"
                 )
 
@@ -6135,7 +6180,7 @@ def main():
             elif status == UNKNOWN:
 
                 unknown_sites.append(
-                    site_name
+                    result_label
                 )
 
             # NOT_FOUND celowo nie wypisujemy,
