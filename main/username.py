@@ -4896,6 +4896,514 @@ def classify_vimeo_profile_response(username, response, profile_url):
 
 
 # ============================================================
+# SPECJALNA DETEKCJA PROFILI DRIBBBLE
+# ============================================================
+
+def _dribbble_profile_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        ("dribbble.com", "www.dribbble.com"),
+        f"/{username}",
+    )
+
+
+def _profile_image_numeric_id(value, path_marker):
+    if not isinstance(value, str):
+        return None
+
+    match = re.search(
+        rf"{re.escape(path_marker)}/(\d+)/",
+        unquote(value),
+        re.IGNORECASE,
+    )
+    return match.group(1) if match else None
+
+
+def classify_dribbble_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(response, "Dribbble")
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    canonical_url = _public_profile_canonical(soup)
+    og_url = _public_profile_meta(soup, "property", "og:url")
+    twitter_creator = _public_profile_meta(soup, "name", "twitter:creator")
+    expected_username = username.casefold()
+
+    final_matches = _dribbble_profile_url_matches(response.url, username)
+    canonical_matches = _dribbble_profile_url_matches(canonical_url, username)
+    og_url_matches = _dribbble_profile_url_matches(og_url, username)
+
+    profile_pages = [
+        item
+        for document in _public_json_ld_documents(soup)
+        for item in _walk_public_json(document)
+        if item.get("@type") == "ProfilePage"
+    ]
+    profile_people = [
+        item.get("mainEntity")
+        for item in profile_pages
+        if isinstance(item.get("mainEntity"), dict)
+        and item["mainEntity"].get("@type") == "Person"
+    ]
+    schema_urls = {
+        str(item.get("url"))
+        for item in profile_pages
+        if item.get("url")
+    }
+    schema_ids = {
+        value
+        for item in (*profile_pages, *profile_people)
+        for value in (_profile_image_numeric_id(item.get("image"), "/users"),)
+        if value
+    }
+    marker_ids = {
+        str(node.get("data-user-id"))
+        for node in soup.select("[data-user-id]")
+        if node.get("data-user-id")
+    }
+    creator_username = twitter_creator.removeprefix("@").casefold()
+    body_profile_marker = bool(soup.body and soup.body.get("id") == "profile")
+
+    conflicts = (
+        bool(response.url and not final_matches),
+        bool(canonical_url and not canonical_matches),
+        bool(og_url and not og_url_matches),
+        bool(creator_username and creator_username != expected_username),
+        any(not _dribbble_profile_url_matches(value, username) for value in schema_urls),
+        len(schema_ids) > 1,
+        len(marker_ids) > 1,
+        bool(schema_ids and marker_ids and schema_ids != marker_ids),
+        any(not value.isdigit() for value in schema_ids | marker_ids),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "Dribbble profile evidence conflict"
+
+    profile_evidence = any((
+        canonical_url,
+        og_url,
+        profile_pages,
+        body_profile_marker,
+        marker_ids,
+    ))
+    if (
+        response.status_code == 404
+        and final_matches
+        and "page you were looking for doesn't exist" in title.casefold()
+        and not profile_evidence
+    ):
+        return NOT_FOUND, None, "public Dribbble profile not found"
+
+    if response.status_code >= 400:
+        return UNKNOWN, None, f"unconfirmed Dribbble HTTP {response.status_code}"
+    if response.status_code != 200 or not final_matches:
+        return UNKNOWN, None, "unexpected Dribbble final URL"
+
+    if (
+        canonical_matches
+        and og_url_matches
+        and creator_username == expected_username
+        and title.casefold().endswith(" | dribbble")
+        and len(profile_pages) == 1
+        and len(profile_people) == 1
+        and len(schema_urls) == 1
+        and body_profile_marker
+        and len(schema_ids) == 1
+        and schema_ids == marker_ids
+    ):
+        return FOUND, profile_url, "public Dribbble profile found; identity not verified"
+
+    return POSSIBLE, profile_url, "incomplete Dribbble public profile evidence"
+
+
+# ============================================================
+# SPECJALNA DETEKCJA PROFILI ABOUT.ME
+# ============================================================
+
+def _aboutme_profile_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        ("about.me", "www.about.me"),
+        f"/{username}",
+    )
+
+
+def _aboutme_public_state(soup):
+    for node in soup.select('script[type="text/json"]'):
+        try:
+            value = json.loads(node.string or node.get_text())
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
+def classify_aboutme_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(response, "About.me")
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    canonical_url = _public_profile_canonical(soup)
+    og_url = _public_profile_meta(soup, "property", "og:url")
+    og_type = _public_profile_meta(soup, "property", "og:type")
+    expected_username = username.casefold()
+    final_matches = _aboutme_profile_url_matches(response.url, username)
+    canonical_matches = _aboutme_profile_url_matches(canonical_url, username)
+    og_url_matches = _aboutme_profile_url_matches(og_url, username)
+
+    people = [
+        item
+        for document in _public_json_ld_documents(soup)
+        for item in _walk_public_json(document)
+        if item.get("@type") == "Person"
+    ]
+    schema_urls = {
+        str(item.get("url"))
+        for item in people
+        if item.get("url")
+    }
+    state = _aboutme_public_state(soup)
+    page = state.get("page", {}) if isinstance(state, dict) else {}
+    public_user = page.get("user", {}) if isinstance(page, dict) else {}
+    if not isinstance(public_user, dict):
+        public_user = {}
+    public_username = str(public_user.get("user_name", "")).casefold()
+    stable_id = str(public_user.get("user_id", ""))
+    profile_marker = soup.select_one(".profile")
+
+    conflicts = (
+        bool(response.url and not final_matches),
+        bool(canonical_url and not canonical_matches),
+        bool(og_url and not og_url_matches),
+        any(not _aboutme_profile_url_matches(value, username) for value in schema_urls),
+        bool(public_username and public_username != expected_username),
+        bool(stable_id and not stable_id.isdigit()),
+        bool(page.get("id") and page.get("id") != "profile"),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "About.me profile evidence conflict"
+
+    profile_evidence = any((canonical_url, og_url, people, public_user, profile_marker))
+    if (
+        response.status_code == 404
+        and final_matches
+        and title.casefold() == "about.me"
+        and not profile_evidence
+    ):
+        return NOT_FOUND, None, "public About.me profile not found"
+
+    if response.status_code >= 400:
+        return UNKNOWN, None, f"unconfirmed About.me HTTP {response.status_code}"
+    if response.status_code != 200 or not final_matches:
+        return UNKNOWN, None, "unexpected About.me final URL"
+
+    if (
+        canonical_matches
+        and og_url_matches
+        and og_type == "aboutme_prod:page"
+        and title.casefold().endswith(" | about.me")
+        and len(people) == 1
+        and len(schema_urls) == 1
+        and public_username == expected_username
+        and stable_id.isdigit()
+        and page.get("id") == "profile"
+        and profile_marker is not None
+    ):
+        return FOUND, profile_url, "public About.me profile found; identity not verified"
+
+    return POSSIBLE, profile_url, "incomplete About.me public profile evidence"
+
+
+# ============================================================
+# SPECJALNA DETEKCJA PROFILI GRAVATAR
+# ============================================================
+
+def _gravatar_profile_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        ("gravatar.com", "www.gravatar.com", "en.gravatar.com"),
+        f"/{username}",
+    )
+
+
+def _gravatar_public_profile(soup):
+    pattern = re.compile(r"const\s+gravatarProfile\s*=\s*(\{.*?\})\s*;", re.DOTALL)
+    for node in soup.find_all("script"):
+        match = pattern.search(node.string or node.get_text())
+        if not match:
+            continue
+        try:
+            value = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
+def _gravatar_avatar_id(value):
+    if not isinstance(value, str):
+        return None
+    match = re.search(r"/avatar/([0-9a-f]{64})(?:[/?]|$)", value, re.IGNORECASE)
+    return match.group(1).casefold() if match else None
+
+
+def classify_gravatar_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(response, "Gravatar")
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    canonical_url = _public_profile_canonical(soup)
+    og_url = _public_profile_meta(soup, "property", "og:url")
+    og_type = _public_profile_meta(soup, "property", "og:type")
+    expected_username = username.casefold()
+    final_matches = _gravatar_profile_url_matches(response.url, username)
+    canonical_matches = _gravatar_profile_url_matches(canonical_url, username)
+    og_url_matches = _gravatar_profile_url_matches(og_url, username)
+
+    people = [
+        item
+        for document in _public_json_ld_documents(soup)
+        for item in _walk_public_json(document)
+        if item.get("@type") == "Person"
+    ]
+    schema_urls = {str(item.get("url")) for item in people if item.get("url")}
+    avatar_ids = {
+        value
+        for item in people
+        for value in (_gravatar_avatar_id(item.get("image")),)
+        if value
+    }
+    public_profile = _gravatar_public_profile(soup)
+    public_username = str(public_profile.get("userLogin", "")).casefold()
+    public_url = str(public_profile.get("profileUrl", ""))
+    login_id = str(public_profile.get("userLoginMD5", "")).casefold()
+    profile_marker = bool(
+        soup.body
+        and "is-profile" in soup.body.get("class", [])
+        and soup.select_one("main.g-profile")
+    )
+
+    conflicts = (
+        bool(response.url and not final_matches),
+        bool(canonical_url and not canonical_matches),
+        bool(og_url and not og_url_matches),
+        any(not _gravatar_profile_url_matches(value, username) for value in schema_urls),
+        bool(public_username and public_username != expected_username),
+        bool(public_url and not _gravatar_profile_url_matches(public_url, username)),
+        len(avatar_ids) > 1,
+        bool(login_id and not re.fullmatch(r"[0-9a-f]{32}", login_id)),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "Gravatar profile evidence conflict"
+
+    profile_evidence = any((og_url, people, public_profile, profile_marker))
+    if response.status_code == 404 and final_matches and not profile_evidence:
+        return NOT_FOUND, None, "public Gravatar profile not found"
+
+    if response.status_code >= 400:
+        return UNKNOWN, None, f"unconfirmed Gravatar HTTP {response.status_code}"
+    if response.status_code != 200 or not final_matches:
+        return UNKNOWN, None, "unexpected Gravatar final URL"
+
+    if (
+        canonical_matches
+        and og_url_matches
+        and og_type.casefold() == "profile"
+        and title.casefold().endswith(" | gravatar")
+        and len(people) == 1
+        and len(schema_urls) == 1
+        and len(avatar_ids) == 1
+        and public_username == expected_username
+        and _gravatar_profile_url_matches(public_url, username)
+        and re.fullmatch(r"[0-9a-f]{32}", login_id)
+        and profile_marker
+    ):
+        return FOUND, profile_url, "public Gravatar profile found; identity not verified"
+
+    return POSSIBLE, profile_url, "incomplete Gravatar public profile evidence"
+
+
+# ============================================================
+# SPECJALNA DETEKCJA PROFILI DEV.TO
+# ============================================================
+
+def _devto_profile_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        ("dev.to", "www.dev.to"),
+        f"/{username}",
+    )
+
+
+def classify_devto_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(response, "DEV.to")
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    canonical_url = _public_profile_canonical(soup)
+    og_url = _public_profile_meta(soup, "property", "og:url")
+    final_matches = _devto_profile_url_matches(response.url, username)
+    canonical_matches = _devto_profile_url_matches(canonical_url, username)
+    og_url_matches = _devto_profile_url_matches(og_url, username)
+
+    people = [
+        item
+        for document in _public_json_ld_documents(soup)
+        for item in _walk_public_json(document)
+        if item.get("@type") == "Person"
+    ]
+    public_urls = {
+        str(value)
+        for item in people
+        for value in (
+            item.get("url"),
+            item.get("mainEntityOfPage", {}).get("@id")
+            if isinstance(item.get("mainEntityOfPage"), dict) else None,
+        )
+        if value
+    }
+    stable_ids = {
+        str(value)
+        for item in people
+        for value in (
+            item.get("identifier"),
+            _profile_image_numeric_id(item.get("image"), "/profile_image"),
+        )
+        if value not in (None, "")
+    }
+    profile_marker = soup.select_one("header.profile-header")
+
+    conflicts = (
+        bool(response.url and not final_matches),
+        bool(canonical_url and not canonical_matches),
+        bool(og_url and not og_url_matches),
+        any(not _devto_profile_url_matches(value, username) for value in public_urls),
+        len(stable_ids) > 1,
+        any(not value.isdigit() for value in stable_ids),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "DEV.to profile evidence conflict"
+
+    profile_evidence = any((canonical_url, og_url, people, profile_marker))
+    if (
+        response.status_code == 404
+        and final_matches
+        and title.casefold() == "404: page not found"
+        and not profile_evidence
+    ):
+        return NOT_FOUND, None, "public DEV.to profile not found"
+
+    if response.status_code >= 400:
+        return UNKNOWN, None, f"unconfirmed DEV.to HTTP {response.status_code}"
+    if response.status_code != 200 or not final_matches:
+        return UNKNOWN, None, "unexpected DEV.to final URL"
+
+    if (
+        canonical_matches
+        and og_url_matches
+        and title.casefold().endswith(" - dev community")
+        and len(people) == 1
+        and len(public_urls) == 1
+        and len(stable_ids) == 1
+        and profile_marker is not None
+    ):
+        return FOUND, profile_url, "public DEV.to profile found; identity not verified"
+
+    return POSSIBLE, profile_url, "incomplete DEV.to public profile evidence"
+
+
+# ============================================================
+# SPECJALNA DETEKCJA PROFILI DISQUS
+# ============================================================
+
+def _disqus_profile_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        ("disqus.com", "www.disqus.com"),
+        f"/by/{username}",
+    )
+
+
+def _disqus_deep_link_username(value):
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(r"disqus://users/([^/?#]+)", value.strip(), re.IGNORECASE)
+    return unquote(match.group(1)).casefold() if match else None
+
+
+def classify_disqus_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(response, "Disqus")
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    canonical_url = _public_profile_canonical(soup)
+    og_url = _public_profile_meta(soup, "property", "og:url")
+    og_type = _public_profile_meta(soup, "property", "og:type")
+    expected_username = username.casefold()
+    final_matches = _disqus_profile_url_matches(response.url, username)
+    canonical_matches = _disqus_profile_url_matches(canonical_url, username)
+    og_url_matches = _disqus_profile_url_matches(og_url, username)
+    deep_links = {
+        value
+        for node in soup.find_all("meta", attrs={"property": "al:iphone:url"})
+        for value in (_disqus_deep_link_username(node.get("content", "")),)
+        if value
+    }
+    title_match = re.fullmatch(
+        r"Disqus Profile - (.+)",
+        title,
+        re.IGNORECASE,
+    )
+    title_username = title_match.group(1).casefold() if title_match else ""
+
+    conflicts = (
+        bool(response.url and not final_matches),
+        bool(canonical_url and not canonical_matches),
+        bool(og_url and not og_url_matches),
+        bool(title_username and title_username != expected_username),
+        bool(deep_links and deep_links != {expected_username}),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "Disqus profile evidence conflict"
+
+    profile_evidence = any((canonical_url, og_url, title_username, deep_links))
+    if (
+        response.status_code == 404
+        and final_matches
+        and title.casefold() == "page not found (404) - disqus"
+        and not profile_evidence
+    ):
+        return NOT_FOUND, None, "public Disqus profile not found"
+
+    if response.status_code >= 400:
+        return UNKNOWN, None, f"unconfirmed Disqus HTTP {response.status_code}"
+    if response.status_code != 200 or not final_matches:
+        return UNKNOWN, None, "unexpected Disqus final URL"
+
+    if (
+        canonical_matches
+        and og_url_matches
+        and og_type.casefold() == "profile"
+        and title_username == expected_username
+        and deep_links == {expected_username}
+    ):
+        return FOUND, profile_url, "public Disqus profile found; identity not verified"
+
+    return POSSIBLE, profile_url, "incomplete Disqus public profile evidence"
+
+
+# ============================================================
 # SPRAWDZANIE JEDNEGO SERWISU
 # ============================================================
 
@@ -5190,6 +5698,51 @@ def check_username_on_site(username, site_name, site_config):
 
         if checker == "vimeo_profile":
             status, link, info = classify_vimeo_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "dribbble_profile":
+            status, link, info = classify_dribbble_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "aboutme_profile":
+            status, link, info = classify_aboutme_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "gravatar_profile":
+            status, link, info = classify_gravatar_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "devto_profile":
+            status, link, info = classify_devto_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "disqus_profile":
+            status, link, info = classify_disqus_profile_response(
                 username,
                 response,
                 url,

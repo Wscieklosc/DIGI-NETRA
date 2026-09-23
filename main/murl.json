@@ -560,6 +560,7 @@
   },
   "Dribbble": {
     "url": "https://dribbble.com/{username}",
+    "checker": "dribbble_profile",
     "detect_based_on_message": false,
     "not_found_status_codes": [404],
     "not_found_message": "This page doesn't exist.",
@@ -894,6 +895,7 @@
   },
   "About.me": {
     "url": "https://about.me/{username}",
+    "checker": "aboutme_profile",
     "detect_based_on_message": true,
     "not_found_status_codes": [404],
     "not_found_message": "Page Not Found",
@@ -996,6 +998,7 @@
   },
   "Gravatar": {
     "url": "https://en.gravatar.com/{username}",
+    "checker": "gravatar_profile",
     "detect_based_on_message": true,
     "not_found_status_codes": [404],
     "not_found_message": "Page Not Found",
@@ -1170,6 +1173,7 @@
   },
   "DEV.to": {
     "url": "https://dev.to/{username}",
+    "checker": "devto_profile",
     "detect_based_on_message": true,
     "not_found_status_codes": [404],
     "not_found_message": "Page Not Found",
@@ -1306,6 +1310,7 @@
   },
   "Gravatar (alt)": {
     "url": "https://gravatar.com/{username}",
+    "checker": "gravatar_profile",
     "detect_based_on_message": true,
     "not_found_status_codes": [404],
     "not_found_message": "Page Not Found",
@@ -1663,6 +1668,7 @@
   },
   "Disqus": {
     "url": "https://disqus.com/by/{username}",
+    "checker": "disqus_profile",
     "detect_based_on_message": true,
     "not_found_status_codes": [404],
     "not_found_message": "Page Not Found",

@@ -3504,5 +3504,393 @@ class NewPublicProfileCheckerConfigTests(unittest.TestCase):
                 self.assertEqual(config[service_name]["checker"], checker)
 
 
+class DribbbleProfileDetectionTests(
+    PublicProfileCheckerMixin,
+    unittest.TestCase,
+):
+    site_name = "Dribbble"
+    default_url = "https://dribbble.com/Test_User"
+    site_config = {
+        "url": "https://dribbble.com/{username}",
+        "checker": "dribbble_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def profile_html(
+        self,
+        *,
+        public_username="Test_User",
+        stable_id="12345",
+        marker_id="12345",
+        include_schema=True,
+    ):
+        schema = ""
+        if include_schema:
+            schema = f"""
+                <script type="application/ld+json">
+                {{
+                    "@type": "ProfilePage",
+                    "url": "https://dribbble.com/{public_username}",
+                    "image": "https://cdn.dribbble.com/users/{stable_id}/avatars/normal/avatar.png",
+                    "mainEntity": {{
+                        "@type": "Person",
+                        "name": "Test User",
+                        "image": "https://cdn.dribbble.com/users/{stable_id}/avatars/normal/avatar.png"
+                    }}
+                }}
+                </script>
+            """
+        return f"""
+            <html><head>
+                <title>Test User | Dribbble</title>
+                <link rel="canonical" href="https://dribbble.com/{public_username}">
+                <meta property="og:url" content="https://dribbble.com/{public_username}">
+                <meta name="twitter:creator" content="@{public_username}">
+                {schema}
+            </head><body id="profile">
+                <div data-user-id="{marker_id}"></div>
+            </body></html>
+        """
+
+    def test_dribbble_certain_found(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html()))[1], FOUND)
+
+    def test_dribbble_confirmed_404_is_not_found(self):
+        html = "<html><title>Sorry, the page you were looking for doesn't exist. (404)</title></html>"
+        self.assertEqual(self.check(self.response(404, html))[1], NOT_FOUND)
+
+    def test_dribbble_username_or_url_conflict_is_unknown(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html(public_username="Other_User")))[1],
+            UNKNOWN,
+        )
+
+    def test_dribbble_stable_id_conflict_is_unknown(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html(marker_id="98765")))[1],
+            UNKNOWN,
+        )
+
+    def test_dribbble_incomplete_data_is_possible(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html(include_schema=False)))[1],
+            POSSIBLE,
+        )
+
+    def test_dribbble_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_dribbble_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+
+class AboutMeProfileDetectionTests(
+    PublicProfileCheckerMixin,
+    unittest.TestCase,
+):
+    site_name = "About.me"
+    default_url = "https://about.me/Test_User"
+    site_config = {
+        "url": "https://about.me/{username}",
+        "checker": "aboutme_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def profile_html(
+        self,
+        *,
+        public_username="Test_User",
+        stable_id=12345,
+        include_state=True,
+    ):
+        state = ""
+        if include_state:
+            data = {
+                "page": {
+                    "id": "profile",
+                    "user": {
+                        "user_id": stable_id,
+                        "user_name": public_username,
+                    },
+                },
+            }
+            state = f'<script type="text/json">{json.dumps(data)}</script>'
+        return f"""
+            <html><head>
+                <title>Test User | about.me</title>
+                <link rel="canonical" href="https://about.me/{public_username}">
+                <meta property="og:url" content="https://about.me/{public_username}">
+                <meta property="og:type" content="aboutme_prod:page">
+                <script type="application/ld+json">
+                {{"@type":"Person","name":"Test User","url":"https://about.me/{public_username}"}}
+                </script>
+                {state}
+            </head><body><main class="profile"></main></body></html>
+        """
+
+    def test_aboutme_certain_found(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html()))[1], FOUND)
+
+    def test_aboutme_confirmed_404_is_not_found(self):
+        self.assertEqual(
+            self.check(self.response(404, "<html><title>about.me</title></html>"))[1],
+            NOT_FOUND,
+        )
+
+    def test_aboutme_username_or_url_conflict_is_unknown(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html(public_username="Other_User")))[1],
+            UNKNOWN,
+        )
+
+    def test_aboutme_stable_id_conflict_is_unknown(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html(stable_id="invalid")))[1],
+            UNKNOWN,
+        )
+
+    def test_aboutme_incomplete_data_is_possible(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html(include_state=False)))[1],
+            POSSIBLE,
+        )
+
+    def test_aboutme_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_aboutme_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+
+class GravatarProfileDetectionTests(
+    PublicProfileCheckerMixin,
+    unittest.TestCase,
+):
+    site_name = "Gravatar"
+    default_url = "https://gravatar.com/Test_User"
+    site_config = {
+        "url": "https://en.gravatar.com/{username}",
+        "checker": "gravatar_profile",
+        "rate_limit_delay": 0,
+    }
+    login_id = "0123456789abcdef0123456789abcdef"
+    avatar_id = "a" * 64
+
+    def profile_html(
+        self,
+        *,
+        public_username="Test_User",
+        login_id=None,
+        include_public_profile=True,
+    ):
+        login_id = self.login_id if login_id is None else login_id
+        public_profile = ""
+        if include_public_profile:
+            data = {
+                "profileUrl": f"https://gravatar.com/{public_username}",
+                "userLogin": public_username,
+                "userLoginMD5": login_id,
+            }
+            public_profile = f"<script>const gravatarProfile = {json.dumps(data)};</script>"
+        return f"""
+            <html><head>
+                <title>Test_User | Gravatar</title>
+                <link rel="canonical" href="https://gravatar.com/{public_username}">
+                <meta property="og:url" content="https://gravatar.com/{public_username}">
+                <meta property="og:type" content="profile">
+                <script type="application/ld+json">
+                {{
+                    "@type":"Person",
+                    "url":"https://gravatar.com/{public_username}",
+                    "name":"Test User",
+                    "image":"https://0.gravatar.com/avatar/{self.avatar_id}"
+                }}
+                </script>
+                {public_profile}
+            </head><body class="is-profile"><main class="g-profile"></main></body></html>
+        """
+
+    def test_gravatar_allowed_domain_redirect_found(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html()))[1], FOUND)
+
+    def test_gravatar_confirmed_404_is_not_found_even_with_canonical(self):
+        html = '<html><head><title>Gravatar - Globally Recognized Avatars</title><link rel="canonical" href="https://gravatar.com/Test_User"></head></html>'
+        self.assertEqual(self.check(self.response(404, html))[1], NOT_FOUND)
+
+    def test_gravatar_username_or_url_conflict_is_unknown(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html(public_username="Other_User")))[1],
+            UNKNOWN,
+        )
+
+    def test_gravatar_stable_id_conflict_is_unknown(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html(login_id="invalid")))[1],
+            UNKNOWN,
+        )
+
+    def test_gravatar_incomplete_data_is_possible(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html(include_public_profile=False)))[1],
+            POSSIBLE,
+        )
+
+    def test_gravatar_unrelated_redirect_is_unknown(self):
+        response = self.response(200, self.profile_html(), url="https://gravatar.com/Other_User")
+        self.assertEqual(self.check(response)[1], UNKNOWN)
+
+    def test_gravatar_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_gravatar_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+
+class DevToProfileDetectionTests(
+    PublicProfileCheckerMixin,
+    unittest.TestCase,
+):
+    site_name = "DEV.to"
+    default_url = "https://dev.to/Test_User"
+    site_config = {
+        "url": "https://dev.to/{username}",
+        "checker": "devto_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def profile_html(
+        self,
+        *,
+        public_username="Test_User",
+        image_id="12345",
+        identifier="12345",
+        include_marker=True,
+    ):
+        marker = '<header class="profile-header"></header>' if include_marker else ""
+        image = (
+            "https://dev-to-uploads.s3.amazonaws.com/uploads/user/"
+            f"profile_image/{image_id}/avatar.png"
+        )
+        return f"""
+            <html><head>
+                <title>Test User - DEV Community</title>
+                <link rel="canonical" href="https://dev.to/{public_username}">
+                <meta property="og:url" content="https://dev.to/{public_username}">
+                <script type="application/ld+json">
+                {{
+                    "@type":"Person",
+                    "identifier":"{identifier}",
+                    "url":"https://dev.to/{public_username}",
+                    "mainEntityOfPage":{{"@type":"WebPage","@id":"https://dev.to/{public_username}"}},
+                    "image":"{image}"
+                }}
+                </script>
+            </head><body>{marker}</body></html>
+        """
+
+    def test_devto_certain_found(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html()))[1], FOUND)
+
+    def test_devto_confirmed_404_is_not_found(self):
+        html = "<html><title>404: Page Not Found</title></html>"
+        self.assertEqual(self.check(self.response(404, html))[1], NOT_FOUND)
+
+    def test_devto_username_or_url_conflict_is_unknown(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html(public_username="Other_User")))[1],
+            UNKNOWN,
+        )
+
+    def test_devto_stable_id_conflict_is_unknown(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html(image_id="98765")))[1],
+            UNKNOWN,
+        )
+
+    def test_devto_incomplete_data_is_possible(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html(include_marker=False)))[1],
+            POSSIBLE,
+        )
+
+    def test_devto_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_devto_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+
+class DisqusProfileDetectionTests(
+    PublicProfileCheckerMixin,
+    unittest.TestCase,
+):
+    site_name = "Disqus"
+    default_url = "https://disqus.com/by/Test_User/"
+    site_config = {
+        "url": "https://disqus.com/by/{username}",
+        "checker": "disqus_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def profile_html(self, *, public_username="Test_User", include_canonical=True):
+        url = f"https://disqus.com/by/{public_username}/"
+        canonical = f'<link rel="canonical" href="{url}">' if include_canonical else ""
+        return f"""
+            <html><head>
+                <title>Disqus Profile - {public_username}</title>
+                {canonical}
+                <meta property="og:url" content="{url}">
+                <meta property="og:type" content="profile">
+                <meta property="al:iphone:url" content="disqus://users/{public_username}">
+            </head></html>
+        """
+
+    def test_disqus_trailing_slash_redirect_found(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html()))[1], FOUND)
+
+    def test_disqus_confirmed_404_is_not_found(self):
+        html = "<html><title>Page not found (404) - Disqus</title></html>"
+        self.assertEqual(self.check(self.response(404, html))[1], NOT_FOUND)
+
+    def test_disqus_username_or_url_conflict_is_unknown(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html(public_username="Other_User")))[1],
+            UNKNOWN,
+        )
+
+    def test_disqus_incomplete_data_is_possible(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html(include_canonical=False)))[1],
+            POSSIBLE,
+        )
+
+    def test_disqus_unrelated_redirect_is_unknown(self):
+        response = self.response(200, self.profile_html(), url="https://disqus.com/by/Other_User/")
+        self.assertEqual(self.check(response)[1], UNKNOWN)
+
+    def test_disqus_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_disqus_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+
+class SecondPublicProfileCheckerConfigTests(unittest.TestCase):
+    def test_five_services_use_dedicated_checkers(self):
+        config = load_sites_config()
+        expected = {
+            "Dribbble": "dribbble_profile",
+            "About.me": "aboutme_profile",
+            "Gravatar": "gravatar_profile",
+            "Gravatar (alt)": "gravatar_profile",
+            "DEV.to": "devto_profile",
+            "Disqus": "disqus_profile",
+        }
+
+        for service_name, checker in expected.items():
+            with self.subTest(service=service_name):
+                self.assertEqual(config[service_name]["checker"], checker)
+
+
 if __name__ == "__main__":
     unittest.main()
