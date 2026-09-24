@@ -318,7 +318,8 @@
     "confidence_score": 0.85
   },
   "HackerRank": {
-    "url": "https://www.hackerrank.com/{username}",
+    "url": "https://www.hackerrank.com/profile/{username}",
+    "checker": "hackerrank_profile",
     "detect_based_on_message": false,
     "not_found_status_codes": [404],
     "not_found_message": "Page not found",
@@ -920,8 +921,9 @@
     "redirect_behavior": "follow",
     "confidence_score": 0.85
   },
-  "AngelList": {
-    "url": "https://angel.co/{username}",
+  "Wellfound": {
+    "url": "https://wellfound.com/p/{username}",
+    "checker": "wellfound_profile",
     "detect_based_on_message": true,
     "not_found_status_codes": [404],
     "not_found_message": "Page Not Found",
@@ -1257,6 +1259,7 @@
   },
   "ReverbNation": {
     "url": "https://www.reverbnation.com/{username}",
+    "checker": "reverbnation_profile",
     "detect_based_on_message": true,
     "not_found_status_codes": [404],
     "not_found_message": "Page Not Found",
@@ -1739,7 +1742,8 @@
     "confidence_score": 0.85
   },
   "Couchsurfing": {
-    "url": "https://couchsurfing.com/people/{username}",
+    "url": "https://www.couchsurfing.com/c/users/{username}",
+    "checker": "couchsurfing_profile",
     "detect_based_on_message": true,
     "not_found_status_codes": [404],
     "not_found_message": "Page Not Found",
@@ -1824,7 +1828,8 @@
     "confidence_score": 0.85
   },
   "Wikidot": {
-    "url": "https://wikidot.com/user:{username}",
+    "url": "https://www.wikidot.com/user:info/{username}",
+    "checker": "wikidot_profile",
     "detect_based_on_message": true,
     "not_found_status_codes":[404],
     "not_found_message": "Page Not Found",

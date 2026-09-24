@@ -8438,6 +8438,528 @@ def classify_gab_profile_response(
 
 
 # ============================================================
+# SPECJALNA DETEKCJA PROFILI HACKERRANK
+# ============================================================
+
+def _hackerrank_profile_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        ("hackerrank.com", "www.hackerrank.com"),
+        f"/profile/{username}",
+    )
+
+
+def classify_hackerrank_profile_response(
+    username,
+    response,
+    api_response,
+    profile_url,
+):
+    transport_result = _public_profile_transport_result(
+        response,
+        "HackerRank",
+    )
+    if transport_result:
+        return transport_result
+    api_transport_result = _public_profile_transport_result(
+        api_response,
+        "HackerRank public API",
+    )
+    if api_transport_result:
+        return api_transport_result
+
+    final_matches = _hackerrank_profile_url_matches(response.url, username)
+    expected_username = username.casefold()
+    try:
+        api_data = api_response.json()
+    except (ValueError, TypeError):
+        api_data = {}
+    if not isinstance(api_data, dict):
+        api_data = {}
+
+    model = api_data.get("model")
+    if not isinstance(model, dict):
+        model = {}
+    public_username = str(model.get("username", ""))
+    profile_id = str(model.get("id", ""))
+    created_at = str(model.get("created_at", ""))
+
+    if (
+        api_response.status_code == 404
+        and final_matches
+        and api_data.get("error") == "Not Found"
+        and not model
+    ):
+        return NOT_FOUND, None, "public HackerRank profile not found"
+
+    conflicts = (
+        bool(response.url and not final_matches),
+        bool(public_username and public_username.casefold() != expected_username),
+        bool(profile_id and (not profile_id.isdigit() or int(profile_id) <= 0)),
+        bool(model and model.get("deleted") is not False),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "HackerRank profile evidence conflict"
+
+    if response.status_code >= 400 or api_response.status_code >= 400:
+        return UNKNOWN, None, "unconfirmed HackerRank profile response"
+    if (
+        response.status_code != 200
+        or api_response.status_code != 200
+        or not final_matches
+    ):
+        return UNKNOWN, None, "unexpected HackerRank profile response"
+
+    if (
+        public_username.casefold() == expected_username
+        and profile_id.isdigit()
+        and int(profile_id) > 0
+        and created_at
+        and model.get("deleted") is False
+        and "level" in model
+        and "avatar" in model
+    ):
+        return (
+            FOUND,
+            response.url,
+            "public HackerRank profile found; identity not verified",
+        )
+
+    return POSSIBLE, profile_url, "incomplete HackerRank profile evidence"
+
+
+# ============================================================
+# SPECJALNA DETEKCJA PROFILI WELLFOUND
+# ============================================================
+
+def _wellfound_profile_slug(value):
+    if not isinstance(value, str) or not value:
+        return None
+    parsed = urlparse(value)
+    if (
+        parsed.scheme not in ("http", "https")
+        or parsed.netloc.casefold() not in ("wellfound.com", "www.wellfound.com")
+    ):
+        return None
+    match = re.fullmatch(r"/(?:p|u)/([^/]+)/?", unquote(parsed.path))
+    return match.group(1) if match else None
+
+
+def classify_wellfound_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(response, "Wellfound")
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    canonical_url = _public_profile_canonical(soup)
+    og_url = _public_profile_meta(soup, "property", "og:url")
+    final_slug = _wellfound_profile_slug(response.url)
+    canonical_slug = _wellfound_profile_slug(canonical_url)
+    og_slug = _wellfound_profile_slug(og_url)
+    expected_username = username.casefold()
+
+    people = [
+        item
+        for document in _public_json_ld_documents(soup)
+        for item in _walk_public_json(document)
+        if item.get("@type") == "Person"
+    ]
+    user_ids = {
+        str(node.get("data-user_id"))
+        for node in soup.select("[data-user_id]")
+        if node.get("data-user_id")
+    }
+    image_ids = {
+        match.group(1)
+        for node in soup.select("img[src]")
+        for match in [re.search(r"/users/(\d+)-", node.get("src", ""))]
+        if match
+    }
+    stable_ids = user_ids | image_ids
+    profile_marker = bool(
+        soup.select_one('[data-_tn="profiles/show/structure"]')
+        or (
+            soup.body
+            and soup.body.get("id") == "profiles"
+            and "show_new" in soup.body.get("class", [])
+        )
+    )
+    heading = soup.find("h1")
+    heading_text = heading.get_text(" ", strip=True) if heading else ""
+
+    if (
+        response.status_code == 404
+        and final_slug
+        and final_slug.casefold() == expected_username
+        and title.casefold() == "page not found - 404 | wellfound"
+        and not canonical_url
+        and not og_url
+        and not people
+        and not stable_ids
+        and not profile_marker
+    ):
+        return NOT_FOUND, None, "public Wellfound profile not found"
+
+    conflicts = (
+        bool(final_slug and final_slug.casefold() != expected_username),
+        bool(response.url and not final_slug),
+        bool(canonical_url and not canonical_slug),
+        bool(canonical_slug and canonical_slug.casefold() != expected_username),
+        bool(og_url and not og_slug),
+        bool(og_slug and og_slug.casefold() != expected_username),
+        len(stable_ids) > 1,
+        any(not value.isdigit() or int(value) <= 0 for value in stable_ids),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "Wellfound profile evidence conflict"
+
+    if response.status_code >= 400:
+        return UNKNOWN, None, f"unconfirmed Wellfound HTTP {response.status_code}"
+    if response.status_code != 200 or not final_slug:
+        return UNKNOWN, None, "unexpected Wellfound final URL"
+
+    metadata_complete = bool(
+        canonical_slug
+        and (not og_url or og_slug)
+        and title.endswith(" | Wellfound")
+        and heading_text
+    )
+    public_data_complete = bool(
+        profile_marker
+        and len(stable_ids) == 1
+        and (len(people) == 1 or response.url.casefold().find("/u/") >= 0)
+    )
+    if metadata_complete and public_data_complete:
+        return (
+            FOUND,
+            response.url,
+            "public Wellfound profile found; identity not verified",
+        )
+
+    return POSSIBLE, profile_url, "incomplete Wellfound profile evidence"
+
+
+# ============================================================
+# SPECJALNA DETEKCJA PROFILI REVERBNATION
+# ============================================================
+
+def _reverbnation_profile_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        (
+            "reverbnation.com",
+            "www.reverbnation.com",
+            "legacy.reverbnation.com",
+        ),
+        f"/{username}",
+    )
+
+
+def _reverbnation_artist_data(html):
+    match = re.search(
+        r'"ARTIST":(\{.*?\}),"ARTIST_EXTRA_DATA"',
+        html,
+        re.DOTALL,
+    )
+    if not match:
+        return {}
+    try:
+        value = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def classify_reverbnation_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(
+        response,
+        "ReverbNation",
+    )
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    canonical_url = _public_profile_canonical(soup)
+    og_url = _public_profile_meta(soup, "property", "og:url")
+    og_type = _public_profile_meta(soup, "property", "og:type")
+    final_matches = _reverbnation_profile_url_matches(response.url, username)
+    canonical_matches = _reverbnation_profile_url_matches(
+        canonical_url,
+        username,
+    )
+    og_url_matches = _reverbnation_profile_url_matches(og_url, username)
+    artist = _reverbnation_artist_data(response.text)
+    expected_username = username.casefold()
+    public_username = str(artist.get("homepage", ""))
+    profile_id = str(artist.get("id", ""))
+    homepage_url = str(artist.get("homepage_url", ""))
+    if homepage_url.startswith("//"):
+        homepage_url = f"https:{homepage_url}"
+    dom_ids = {
+        match.group(1)
+        for node in soup.select("[data-page-object-id]")
+        for match in [
+            re.fullmatch(r"artist_(\d+)", node.get("data-page-object-id", ""))
+        ]
+        if match
+    }
+    marker = soup.select_one("#page_object_profile_header")
+    headings = {
+        node.get_text(" ", strip=True)
+        for node in soup.select("h1.qa-artist-name")
+        if node.get_text(" ", strip=True)
+    }
+
+    if (
+        response.status_code == 404
+        and final_matches
+        and title.casefold()
+        == "the page you were looking for doesn't exist (404 not found)"
+        and not canonical_url
+        and not og_url
+        and not artist
+        and marker is None
+        and not dom_ids
+    ):
+        return NOT_FOUND, None, "public ReverbNation profile not found"
+
+    conflicts = (
+        bool(response.url and not final_matches),
+        bool(canonical_url and not canonical_matches),
+        bool(og_url and not og_url_matches),
+        bool(public_username and public_username.casefold() != expected_username),
+        bool(homepage_url and not _reverbnation_profile_url_matches(homepage_url, username)),
+        bool(profile_id and (not profile_id.isdigit() or int(profile_id) <= 0)),
+        bool(profile_id and dom_ids and dom_ids != {profile_id}),
+        len(dom_ids) > 1,
+        bool(artist and artist.get("type") != "artist"),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "ReverbNation profile evidence conflict"
+
+    if response.status_code >= 400:
+        return UNKNOWN, None, f"unconfirmed ReverbNation HTTP {response.status_code}"
+    if response.status_code != 200 or not final_matches:
+        return UNKNOWN, None, "unexpected ReverbNation final URL"
+
+    if (
+        urlparse(response.url).netloc.casefold() == "legacy.reverbnation.com"
+        and canonical_matches
+        and og_url_matches
+        and og_type.casefold() == "band"
+        and public_username.casefold() == expected_username
+        and profile_id.isdigit()
+        and homepage_url
+        and marker is not None
+        and dom_ids == {profile_id}
+        and len(headings) == 1
+        and title.endswith(" | ReverbNation")
+    ):
+        return (
+            FOUND,
+            response.url,
+            "public ReverbNation profile found; identity not verified",
+        )
+
+    return POSSIBLE, profile_url, "incomplete ReverbNation profile evidence"
+
+
+# ============================================================
+# SPECJALNA DETEKCJA PROFILI COUCHSURFING
+# ============================================================
+
+def _couchsurfing_profile_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        ("couchsurfing.com", "www.couchsurfing.com"),
+        f"/c/users/{username}",
+    )
+
+
+def _couchsurfing_profile_ids(html):
+    return set(
+        re.findall(
+            r'profileId\\*"\s*:\s*\\*"([^"\\]+)',
+            html,
+        )
+    )
+
+
+def classify_couchsurfing_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(
+        response,
+        "Couchsurfing",
+    )
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    canonical_url = _public_profile_canonical(soup)
+    og_url = _public_profile_meta(soup, "property", "og:url")
+    og_type = _public_profile_meta(soup, "property", "og:type")
+    profile_username = _public_profile_meta(
+        soup,
+        "property",
+        "profile:username",
+    )
+    expected_username = username.casefold()
+    final_matches = _couchsurfing_profile_url_matches(response.url, username)
+    canonical_matches = _couchsurfing_profile_url_matches(
+        canonical_url,
+        username,
+    )
+    og_url_matches = _couchsurfing_profile_url_matches(og_url, username)
+    people = [
+        item
+        for document in _public_json_ld_documents(soup)
+        for item in _walk_public_json(document)
+        if item.get("@type") == "Person"
+    ]
+    person_urls = {
+        str(person.get("url"))
+        for person in people
+        if person.get("url")
+    }
+    profile_ids = _couchsurfing_profile_ids(response.text)
+    marker = soup.select_one('[data-testid="user-profile-container"]')
+
+    if (
+        response.status_code in (404, 410)
+        and final_matches
+        and title.casefold() == "couchsurfing"
+        and not canonical_url
+        and not profile_username
+        and og_url.rstrip("/").casefold() == "https://www.couchsurfing.com"
+        and og_type.casefold() == "website"
+        and not people
+        and not profile_ids
+        and marker is None
+    ):
+        return NOT_FOUND, None, "public Couchsurfing profile not found"
+
+    conflicts = (
+        bool(response.url and not final_matches),
+        bool(canonical_url and not canonical_matches),
+        bool(og_url and og_type.casefold() == "profile" and not og_url_matches),
+        bool(profile_username and profile_username.casefold() != expected_username),
+        any(not _couchsurfing_profile_url_matches(value, username) for value in person_urls),
+        len(profile_ids) > 1,
+        any(not value.endswith("_pf") for value in profile_ids),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "Couchsurfing profile evidence conflict"
+
+    if response.status_code >= 400:
+        return UNKNOWN, None, f"unconfirmed Couchsurfing HTTP {response.status_code}"
+    if response.status_code != 200 or not final_matches:
+        return UNKNOWN, None, "unexpected Couchsurfing final URL"
+
+    if (
+        canonical_matches
+        and og_url_matches
+        and og_type.casefold() == "profile"
+        and profile_username.casefold() == expected_username
+        and len(people) == 1
+        and person_urls
+        and len(profile_ids) == 1
+        and marker is not None
+        and title.endswith(" - Profile - Couchsurfing")
+    ):
+        return (
+            FOUND,
+            response.url,
+            "public Couchsurfing profile found; identity not verified",
+        )
+
+    return POSSIBLE, profile_url, "incomplete Couchsurfing profile evidence"
+
+
+# ============================================================
+# SPECJALNA DETEKCJA PROFILI WIKIDOT
+# ============================================================
+
+def _wikidot_profile_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        ("wikidot.com", "www.wikidot.com"),
+        f"/user:info/{username}",
+    )
+
+
+def classify_wikidot_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(response, "Wikidot")
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    final_matches = _wikidot_profile_url_matches(response.url, username)
+    expected_username = username.casefold()
+    heading = soup.select_one("h1.profile-title")
+    heading_text = heading.get_text(" ", strip=True) if heading else ""
+    profile_box = soup.select_one("#user-info-area .profile-box")
+    error_block = soup.select_one("#page-content .error-block")
+    error_text = error_block.get_text(" ", strip=True) if error_block else ""
+    avatar_ids = {
+        match.group(1)
+        for node in soup.select('h1.profile-title img[src*="avatar.php"]')
+        for match in [re.search(r"[?&]userid=(\d+)", node.get("src", ""))]
+        if match
+    }
+    flag_ids = set(
+        re.findall(r"flagUser\(event,(\d+)\)", response.text)
+    )
+    stable_ids = avatar_ids | flag_ids
+
+    if (
+        response.status_code == 200
+        and final_matches
+        and title.casefold()
+        == "user information - wikidot - free and pro wiki hosting"
+        and error_text.casefold() == "user does not exist."
+        and heading is None
+        and profile_box is None
+        and not stable_ids
+    ):
+        return NOT_FOUND, None, "public Wikidot profile not found"
+
+    conflicts = (
+        bool(response.url and not final_matches),
+        bool(heading_text and heading_text.casefold() != expected_username),
+        len(stable_ids) > 1,
+        any(not value.isdigit() or int(value) <= 0 for value in stable_ids),
+        bool(error_text and error_text.casefold() != "user does not exist."),
+        bool(error_text and heading is not None),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "Wikidot profile evidence conflict"
+
+    if response.status_code >= 400:
+        return UNKNOWN, None, f"unconfirmed Wikidot HTTP {response.status_code}"
+    if response.status_code != 200 or not final_matches:
+        return UNKNOWN, None, "unexpected Wikidot final URL"
+
+    if (
+        title.casefold() == f"wikidot.com: {username}".casefold()
+        and heading_text.casefold() == expected_username
+        and profile_box is not None
+        and len(stable_ids) == 1
+        and avatar_ids == flag_ids
+        and not error_text
+    ):
+        return (
+            FOUND,
+            response.url,
+            "public Wikidot profile found; identity not verified",
+        )
+
+    return POSSIBLE, profile_url, "incomplete Wikidot profile evidence"
+
+
+# ============================================================
 # SPRAWDZANIE JEDNEGO SERWISU
 # ============================================================
 
@@ -9018,6 +9540,71 @@ def check_username_on_site(username, site_name, site_config):
                 username,
                 response,
                 api_response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "hackerrank_profile":
+            web_transport_result = _public_profile_transport_result(
+                response,
+                "HackerRank",
+            )
+            if web_transport_result:
+                status, link, info = web_transport_result
+                return site_name, status, link, info
+
+            api_url = (
+                "https://www.hackerrank.com/rest/contests/master/hackers/"
+                f"{quote(username, safe='')}/profile"
+            )
+            api_response = requests.request(
+                method="GET",
+                url=api_url,
+                headers=headers,
+                timeout=timeout,
+                allow_redirects=True,
+            )
+            status, link, info = classify_hackerrank_profile_response(
+                username,
+                response,
+                api_response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "wellfound_profile":
+            status, link, info = classify_wellfound_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "reverbnation_profile":
+            status, link, info = classify_reverbnation_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "couchsurfing_profile":
+            status, link, info = classify_couchsurfing_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "wikidot_profile":
+            status, link, info = classify_wikidot_profile_response(
+                username,
+                response,
                 url,
             )
 

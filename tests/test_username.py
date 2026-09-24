@@ -5969,6 +5969,456 @@ class GabProfileDetectionTests(unittest.TestCase):
         self.assertEqual(result[1], ERROR)
 
 
+class HackerRankProfileDetectionTests(unittest.TestCase):
+    username = "Test_User"
+    site_name = "HackerRank"
+    site_config = {
+        "url": "https://www.hackerrank.com/profile/{username}",
+        "checker": "hackerrank_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def response(self, status_code, text="", url=None, json_data=None):
+        response = Mock()
+        response.status_code = status_code
+        response.text = text
+        response.url = url or "https://www.hackerrank.com/profile/Test_User"
+        if json_data is None:
+            response.json.side_effect = ValueError
+        else:
+            response.json.return_value = json_data
+        return response
+
+    def api_data(self, *, username="Test_User", profile_id=12345, **overrides):
+        model = {
+            "id": profile_id,
+            "username": username,
+            "created_at": "2020-01-02T03:04:05.000Z",
+            "deleted": False,
+            "level": 3,
+            "avatar": "https://hrcdn.net/avatar.png",
+        }
+        model.update(overrides)
+        return {"model": model}
+
+    def check(self, web_response, api_response=None):
+        responses = [web_response]
+        if api_response is not None:
+            responses.append(api_response)
+        with (
+            patch("main.username.requests.request", side_effect=responses),
+            patch("main.username.time.sleep"),
+        ):
+            return check_username_on_site(
+                self.username,
+                self.site_name,
+                self.site_config,
+            )
+
+    def test_hackerrank_certain_found(self):
+        web = self.response(200, "<html><body><div id='content'></div></body></html>")
+        api = self.response(200, json_data=self.api_data())
+        self.assertEqual(self.check(web, api)[1], FOUND)
+
+    def test_hackerrank_confirmed_not_found(self):
+        web = self.response(200, "<html><body><div id='content'></div></body></html>")
+        api = self.response(404, json_data={"error": "Not Found"})
+        self.assertEqual(self.check(web, api)[1], NOT_FOUND)
+
+    def test_hackerrank_username_conflict_is_unknown(self):
+        web = self.response(200)
+        api = self.response(200, json_data=self.api_data(username="Other_User"))
+        self.assertEqual(self.check(web, api)[1], UNKNOWN)
+
+    def test_hackerrank_url_conflict_is_unknown(self):
+        web = self.response(200, url="https://www.hackerrank.com/profile/Other_User")
+        api = self.response(200, json_data=self.api_data())
+        self.assertEqual(self.check(web, api)[1], UNKNOWN)
+
+    def test_hackerrank_invalid_stable_id_is_unknown(self):
+        web = self.response(200)
+        api = self.response(200, json_data=self.api_data(profile_id="different-id"))
+        self.assertEqual(self.check(web, api)[1], UNKNOWN)
+
+    def test_hackerrank_incomplete_data_is_possible(self):
+        web = self.response(200)
+        api = self.response(200, json_data=self.api_data(created_at=""))
+        self.assertEqual(self.check(web, api)[1], POSSIBLE)
+
+    def test_hackerrank_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_hackerrank_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+    def test_hackerrank_5xx_is_error(self):
+        self.assertEqual(self.check(self.response(503))[1], ERROR)
+
+    def test_hackerrank_public_api_5xx_is_error(self):
+        web = self.response(200)
+        api = self.response(503)
+        self.assertEqual(self.check(web, api)[1], ERROR)
+
+    def test_hackerrank_public_api_network_failure_is_error(self):
+        web = self.response(200)
+        with (
+            patch(
+                "main.username.requests.request",
+                side_effect=[
+                    web,
+                    requests.ConnectionError("network unavailable"),
+                ],
+            ),
+            patch("main.username.time.sleep"),
+        ):
+            result = check_username_on_site(
+                self.username,
+                self.site_name,
+                self.site_config,
+            )
+        self.assertEqual(result[1], ERROR)
+
+
+class WellfoundProfileDetectionTests(PublicProfileCheckerMixin, unittest.TestCase):
+    site_name = "Wellfound"
+    default_url = "https://wellfound.com/p/Test_User"
+    site_config = {
+        "url": "https://wellfound.com/p/{username}",
+        "checker": "wellfound_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def profile_html(
+        self,
+        *,
+        canonical_username="Test_User",
+        og_username="Test_User",
+        user_id="12345",
+        image_id=None,
+        include_marker=True,
+        include_person=True,
+        current_route="p",
+    ):
+        image_id = image_id or user_id
+        marker = (
+            '<div data-_tn="profiles/show/structure">'
+            f'<div data-user_id="{user_id}"></div></div>'
+            if include_marker
+            else ""
+        )
+        person = (
+            '<script type="application/ld+json">'
+            + json.dumps({"@context": "https://schema.org", "@type": "Person", "name": "Test Name"})
+            + "</script>"
+            if include_person
+            else ""
+        )
+        og = (
+            f'<meta property="og:url" content="https://wellfound.com/{current_route}/{og_username}">'
+            if og_username is not None
+            else ""
+        )
+        body_attributes = 'id="profiles" class="show_new"' if include_marker else ""
+        return f'''
+            <html><head><title>Test Name | Wellfound</title>
+            <link rel="canonical" href="https://wellfound.com/{current_route}/{canonical_username}">
+            {og}{person}</head><body {body_attributes}>
+            <h1>Test Name</h1>{marker}
+            <img src="https://photos.wellfound.com/users/{image_id}-large.jpg">
+            </body></html>
+        '''
+
+    def test_wellfound_certain_found(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html()))[1], FOUND)
+
+    def test_wellfound_confirmed_u_route_redirect_is_found(self):
+        html = self.profile_html(
+            current_route="u",
+            og_username=None,
+            include_person=False,
+        )
+        response = self.response(200, html, "https://wellfound.com/u/Test_User")
+        self.assertEqual(self.check(response)[1], FOUND)
+
+    def test_wellfound_confirmed_404_is_not_found(self):
+        html = "<html><head><title>Page not found - 404 | Wellfound</title></head><body></body></html>"
+        self.assertEqual(self.check(self.response(404, html))[1], NOT_FOUND)
+
+    def test_wellfound_username_conflict_is_unknown(self):
+        html = self.profile_html(canonical_username="Other_User")
+        self.assertEqual(self.check(self.response(200, html))[1], UNKNOWN)
+
+    def test_wellfound_url_conflict_is_unknown(self):
+        response = self.response(200, self.profile_html(), "https://wellfound.com/p/Other_User")
+        self.assertEqual(self.check(response)[1], UNKNOWN)
+
+    def test_wellfound_stable_id_conflict_is_unknown(self):
+        html = self.profile_html(image_id="99999")
+        self.assertEqual(self.check(self.response(200, html))[1], UNKNOWN)
+
+    def test_wellfound_incomplete_data_is_possible(self):
+        html = self.profile_html(include_marker=False)
+        self.assertEqual(self.check(self.response(200, html))[1], POSSIBLE)
+
+    def test_wellfound_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_wellfound_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+    def test_wellfound_5xx_is_error(self):
+        self.assertEqual(self.check(self.response(502))[1], ERROR)
+
+
+class ReverbNationProfileDetectionTests(PublicProfileCheckerMixin, unittest.TestCase):
+    site_name = "ReverbNation"
+    default_url = "https://legacy.reverbnation.com/Test_User"
+    site_config = {
+        "url": "https://www.reverbnation.com/{username}",
+        "checker": "reverbnation_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def profile_html(
+        self,
+        *,
+        public_username="Test_User",
+        canonical_username="Test_User",
+        profile_id="12345",
+        dom_id=None,
+        include_marker=True,
+    ):
+        dom_id = dom_id or profile_id
+        artist = {
+            "id": int(profile_id) if profile_id.isdigit() else profile_id,
+            "name": "Test Artist",
+            "homepage": public_username,
+            "homepage_url": f"//legacy.reverbnation.com/{public_username}",
+            "type": "artist",
+        }
+        marker = '<div id="page_object_profile_header"></div>' if include_marker else ""
+        return f'''
+            <html><head><title>Test Artist | ReverbNation</title>
+            <link rel="canonical" href="https://legacy.reverbnation.com/{canonical_username}">
+            <meta property="og:url" content="http://legacy.reverbnation.com/{canonical_username}">
+            <meta property="og:type" content="band"></head><body>
+            {marker}<h1 class="qa-artist-name">Test Artist</h1>
+            <div data-page-object-id="artist_{dom_id}"></div>
+            <script>var config = {json.dumps({"ARTIST": artist})};</script>
+            </body></html>
+        '''.replace(
+            json.dumps({"ARTIST": artist}),
+            '{"ARTIST":' + json.dumps(artist) + ',"ARTIST_EXTRA_DATA":{}}',
+        )
+
+    def test_reverbnation_confirmed_legacy_redirect_is_found(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html()))[1], FOUND)
+
+    def test_reverbnation_confirmed_404_is_not_found(self):
+        html = "<html><head><title>The page you were looking for doesn't exist (404 Not found)</title></head></html>"
+        response = self.response(404, html, "https://www.reverbnation.com/Test_User")
+        self.assertEqual(self.check(response)[1], NOT_FOUND)
+
+    def test_reverbnation_username_conflict_is_unknown(self):
+        html = self.profile_html(public_username="Other_User")
+        self.assertEqual(self.check(self.response(200, html))[1], UNKNOWN)
+
+    def test_reverbnation_url_conflict_is_unknown(self):
+        html = self.profile_html(canonical_username="Other_User")
+        self.assertEqual(self.check(self.response(200, html))[1], UNKNOWN)
+
+    def test_reverbnation_stable_id_conflict_is_unknown(self):
+        html = self.profile_html(dom_id="99999")
+        self.assertEqual(self.check(self.response(200, html))[1], UNKNOWN)
+
+    def test_reverbnation_incomplete_data_is_possible(self):
+        html = self.profile_html(include_marker=False)
+        self.assertEqual(self.check(self.response(200, html))[1], POSSIBLE)
+
+    def test_reverbnation_unconfirmed_redirect_is_unknown(self):
+        response = self.response(200, self.profile_html(), "https://legacy.reverbnation.com/Other_User")
+        self.assertEqual(self.check(response)[1], UNKNOWN)
+
+    def test_reverbnation_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_reverbnation_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+    def test_reverbnation_5xx_is_error(self):
+        self.assertEqual(self.check(self.response(503))[1], ERROR)
+
+
+class CouchsurfingProfileDetectionTests(PublicProfileCheckerMixin, unittest.TestCase):
+    site_name = "Couchsurfing"
+    default_url = "https://www.couchsurfing.com/c/users/Test_User"
+    site_config = {
+        "url": "https://www.couchsurfing.com/c/users/{username}",
+        "checker": "couchsurfing_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def profile_html(
+        self,
+        *,
+        public_username="Test_User",
+        canonical_username="Test_User",
+        profile_ids=("profile123_pf",),
+        include_marker=True,
+    ):
+        schema = {
+            "@context": "https://schema.org",
+            "@type": "Person",
+            "name": "Test Name",
+            "url": f"https://www.couchsurfing.com/c/users/{public_username}",
+        }
+        ids = "".join(
+            f'<script type="application/json">{{"profileId":"{profile_id}"}}</script>'
+            for profile_id in profile_ids
+        )
+        marker = '<main data-testid="user-profile-container"><h1>Test Name</h1></main>' if include_marker else "<h1>Test Name</h1>"
+        return f'''
+            <html><head><title>Test Name - Profile - Couchsurfing</title>
+            <link rel="canonical" href="https://www.couchsurfing.com/c/users/{canonical_username}">
+            <meta property="og:url" content="https://www.couchsurfing.com/c/users/{canonical_username}">
+            <meta property="og:type" content="profile">
+            <meta property="profile:username" content="{public_username}">
+            <script type="application/ld+json">{json.dumps(schema)}</script>
+            </head><body>{marker}{ids}</body></html>
+        '''
+
+    def test_couchsurfing_certain_found(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html()))[1], FOUND)
+
+    def test_couchsurfing_confirmed_410_is_not_found(self):
+        html = '''<html><head><title>Couchsurfing</title>
+            <meta property="og:url" content="https://www.couchsurfing.com">
+            <meta property="og:type" content="website"></head><body></body></html>'''
+        self.assertEqual(self.check(self.response(410, html))[1], NOT_FOUND)
+
+    def test_couchsurfing_current_confirmed_404_is_not_found(self):
+        html = '''<html><head><title>Couchsurfing</title>
+            <meta property="og:url" content="https://www.couchsurfing.com">
+            <meta property="og:type" content="website"></head><body></body></html>'''
+        self.assertEqual(self.check(self.response(404, html))[1], NOT_FOUND)
+
+    def test_couchsurfing_username_conflict_is_unknown(self):
+        html = self.profile_html(public_username="Other_User")
+        self.assertEqual(self.check(self.response(200, html))[1], UNKNOWN)
+
+    def test_couchsurfing_url_conflict_is_unknown(self):
+        html = self.profile_html(canonical_username="Other_User")
+        self.assertEqual(self.check(self.response(200, html))[1], UNKNOWN)
+
+    def test_couchsurfing_stable_id_conflict_is_unknown(self):
+        html = self.profile_html(profile_ids=("profile123_pf", "other456_pf"))
+        self.assertEqual(self.check(self.response(200, html))[1], UNKNOWN)
+
+    def test_couchsurfing_incomplete_data_is_possible(self):
+        html = self.profile_html(include_marker=False)
+        self.assertEqual(self.check(self.response(200, html))[1], POSSIBLE)
+
+    def test_couchsurfing_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_couchsurfing_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+    def test_couchsurfing_5xx_is_error(self):
+        self.assertEqual(self.check(self.response(500))[1], ERROR)
+
+
+class WikidotProfileDetectionTests(PublicProfileCheckerMixin, unittest.TestCase):
+    site_name = "Wikidot"
+    default_url = "https://www.wikidot.com/user:info/Test_User"
+    site_config = {
+        "url": "https://www.wikidot.com/user:info/{username}",
+        "checker": "wikidot_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def profile_html(
+        self,
+        *,
+        public_username="Test_User",
+        avatar_id="2462",
+        flag_id=None,
+        include_profile_box=True,
+    ):
+        flag_id = flag_id or avatar_id
+        profile_box = '<div id="user-info-area"><div class="profile-box"></div></div>' if include_profile_box else ""
+        return f'''
+            <html><head><title>Wikidot.com: {public_username}</title></head><body>
+            <a onclick="UserInfoModule.listeners.flagUser(event,{flag_id})">flag user</a>
+            <h1 class="profile-title"><img src="https://www.wikidot.com/avatar.php?userid={avatar_id}">{public_username}</h1>
+            {profile_box}</body></html>
+        '''
+
+    def test_wikidot_certain_found(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html()))[1], FOUND)
+
+    def test_wikidot_structural_soft_404_is_not_found(self):
+        html = '''<html><head><title>User Information - Wikidot - Free and Pro Wiki Hosting</title></head>
+            <body><div id="page-content"><div class="error-block">User does not exist.</div></div></body></html>'''
+        self.assertEqual(self.check(self.response(200, html))[1], NOT_FOUND)
+
+    def test_wikidot_username_conflict_is_unknown(self):
+        html = self.profile_html(public_username="Other_User")
+        self.assertEqual(self.check(self.response(200, html))[1], UNKNOWN)
+
+    def test_wikidot_url_conflict_is_unknown(self):
+        response = self.response(200, self.profile_html(), "https://www.wikidot.com/user:info/Other_User")
+        self.assertEqual(self.check(response)[1], UNKNOWN)
+
+    def test_wikidot_stable_id_conflict_is_unknown(self):
+        html = self.profile_html(flag_id="9999")
+        self.assertEqual(self.check(self.response(200, html))[1], UNKNOWN)
+
+    def test_wikidot_incomplete_data_is_possible(self):
+        html = self.profile_html(include_profile_box=False)
+        self.assertEqual(self.check(self.response(200, html))[1], POSSIBLE)
+
+    def test_wikidot_unrecognized_soft_error_is_unknown(self):
+        html = '<html><head><title>User Information</title></head><body><div id="page-content"><div class="error-block">Temporary error.</div></div></body></html>'
+        self.assertEqual(self.check(self.response(200, html))[1], UNKNOWN)
+
+    def test_wikidot_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_wikidot_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+    def test_wikidot_5xx_is_error(self):
+        self.assertEqual(self.check(self.response(503))[1], ERROR)
+
+
+class EighthPublicProfileNetworkErrorTests(unittest.TestCase):
+    def test_network_errors_are_error_for_all_five_checkers(self):
+        configs = {
+            "HackerRank": ("https://www.hackerrank.com/profile/{username}", "hackerrank_profile"),
+            "Wellfound": ("https://wellfound.com/p/{username}", "wellfound_profile"),
+            "ReverbNation": ("https://www.reverbnation.com/{username}", "reverbnation_profile"),
+            "Couchsurfing": ("https://www.couchsurfing.com/c/users/{username}", "couchsurfing_profile"),
+            "Wikidot": ("https://www.wikidot.com/user:info/{username}", "wikidot_profile"),
+        }
+
+        for service_name, (url, checker) in configs.items():
+            with self.subTest(service=service_name), patch(
+                "main.username.requests.request",
+                side_effect=requests.ConnectionError("network unavailable"),
+            ), patch("main.username.time.sleep"):
+                result = check_username_on_site(
+                    "Test_User",
+                    service_name,
+                    {
+                        "url": url,
+                        "checker": checker,
+                        "rate_limit_delay": 0,
+                    },
+                )
+                self.assertEqual(result[1], ERROR)
+
+
 class SeventhPublicProfileNetworkErrorTests(unittest.TestCase):
     def test_network_errors_are_error_for_all_three_checkers(self):
         configs = {
@@ -6080,6 +6530,39 @@ class SeventhPublicProfileCheckerConfigTests(unittest.TestCase):
 
         for service_name, checker in expected.items():
             with self.subTest(service=service_name):
+                self.assertEqual(config[service_name]["checker"], checker)
+
+
+class EighthPublicProfileCheckerConfigTests(unittest.TestCase):
+    def test_five_services_use_correct_endpoints_and_checkers(self):
+        config = load_sites_config()
+        expected = {
+            "HackerRank": (
+                "https://www.hackerrank.com/profile/{username}",
+                "hackerrank_profile",
+            ),
+            "Wellfound": (
+                "https://wellfound.com/p/{username}",
+                "wellfound_profile",
+            ),
+            "ReverbNation": (
+                "https://www.reverbnation.com/{username}",
+                "reverbnation_profile",
+            ),
+            "Couchsurfing": (
+                "https://www.couchsurfing.com/c/users/{username}",
+                "couchsurfing_profile",
+            ),
+            "Wikidot": (
+                "https://www.wikidot.com/user:info/{username}",
+                "wikidot_profile",
+            ),
+        }
+
+        self.assertNotIn("AngelList", config)
+        for service_name, (url, checker) in expected.items():
+            with self.subTest(service=service_name):
+                self.assertEqual(config[service_name]["url"], url)
                 self.assertEqual(config[service_name]["checker"], checker)
 
 
