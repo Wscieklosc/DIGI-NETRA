@@ -5435,6 +5435,709 @@ def classify_disqus_profile_response(username, response, profile_url):
 
 
 # ============================================================
+# SPECJALNA DETEKCJA PROFILI CHESS.COM
+# ============================================================
+
+def _chesscom_profile_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        ("chess.com", "www.chess.com"),
+        f"/member/{username}",
+    )
+
+
+def _chesscom_script_profile_records(soup):
+    records = []
+    pattern = re.compile(
+        r'userId:\s*(\d+)\s*,\s*'
+        r'username:\s*"([^"]+)"\s*,\s*'
+        r'uuid:\s*"([0-9a-f-]+)"',
+        re.IGNORECASE,
+    )
+    for node in soup.find_all("script"):
+        for match in pattern.finditer(node.string or node.get_text()):
+            records.append(match.groups())
+    return records
+
+
+def classify_chesscom_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(response, "Chess.com")
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    canonical_url = _public_profile_canonical(soup)
+    og_url = _public_profile_meta(soup, "property", "og:url")
+    og_title = _public_profile_meta(soup, "property", "og:title")
+    expected_username = username.casefold()
+
+    final_matches = _chesscom_profile_url_matches(response.url, username)
+    canonical_matches = _chesscom_profile_url_matches(canonical_url, username)
+    og_url_matches = _chesscom_profile_url_matches(og_url, username)
+
+    profile_nodes = soup.select(
+        ".profile-header-container[data-username][data-user-id], "
+        "#view-profile[data-username][data-user-id]"
+    )
+    dom_usernames = {
+        str(node.get("data-username", "")).casefold()
+        for node in profile_nodes
+        if node.get("data-username")
+    }
+    dom_ids = {
+        str(node.get("data-user-id", ""))
+        for node in profile_nodes
+        if node.get("data-user-id")
+    }
+    dom_uuids = {
+        str(node.get("data-user-uuid", "")).casefold()
+        for node in profile_nodes
+        if node.get("data-user-uuid")
+    }
+    script_records = _chesscom_script_profile_records(soup)
+    script_ids = {record[0] for record in script_records}
+    script_usernames = {record[1].casefold() for record in script_records}
+    script_uuids = {record[2].casefold() for record in script_records}
+
+    title_pattern = re.compile(
+        rf"\({re.escape(username)}\)\s+-\s+Chess Profile(?:\s+-\s+Chess\.com)?$",
+        re.IGNORECASE,
+    )
+    title_matches = bool(title_pattern.search(title))
+    og_title_matches = bool(title_pattern.search(og_title))
+
+    conflicts = (
+        bool(response.url and not final_matches),
+        bool(canonical_url and not canonical_matches),
+        bool(og_url and not og_url_matches),
+        bool(dom_usernames and dom_usernames != {expected_username}),
+        bool(script_usernames and script_usernames != {expected_username}),
+        len(dom_ids) > 1,
+        len(script_ids) > 1,
+        bool(dom_ids and script_ids and dom_ids != script_ids),
+        any(not value.isdigit() for value in dom_ids | script_ids),
+        len(dom_uuids) > 1,
+        len(script_uuids) > 1,
+        bool(dom_uuids and script_uuids and dom_uuids != script_uuids),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "Chess.com profile evidence conflict"
+
+    profile_evidence = any((
+        canonical_url,
+        og_url,
+        profile_nodes,
+        script_records,
+    ))
+    if (
+        response.status_code == 404
+        and final_matches
+        and title.casefold() == "missing page - chess.com"
+        and not profile_evidence
+    ):
+        return NOT_FOUND, None, "public Chess.com profile not found"
+
+    if response.status_code >= 400:
+        return UNKNOWN, None, f"unconfirmed Chess.com HTTP {response.status_code}"
+    if response.status_code != 200 or not final_matches:
+        return UNKNOWN, None, "unexpected Chess.com final URL"
+
+    profile_marker = bool(
+        soup.select_one(".profile-header-container .profile-header")
+    )
+    stable_ids_match = bool(
+        len(dom_ids) == 1
+        and dom_ids == script_ids
+        and len(dom_uuids) == 1
+        and dom_uuids == script_uuids
+    )
+    if (
+        canonical_matches
+        and og_url_matches
+        and title_matches
+        and og_title_matches
+        and dom_usernames == {expected_username}
+        and script_usernames == {expected_username}
+        and stable_ids_match
+        and len(profile_nodes) >= 2
+        and profile_marker
+    ):
+        return (
+            FOUND,
+            profile_url,
+            "public Chess.com profile found; identity not verified",
+        )
+
+    return POSSIBLE, profile_url, "incomplete Chess.com public profile evidence"
+
+
+# ============================================================
+# SPECJALNA DETEKCJA PROFILI ROBLOX
+# ============================================================
+
+def _roblox_profile_id(value):
+    if not isinstance(value, str) or not value:
+        return None
+    parsed = urlparse(value)
+    if (
+        parsed.scheme not in ("http", "https")
+        or parsed.netloc.casefold() not in ("roblox.com", "www.roblox.com")
+    ):
+        return None
+    match = re.fullmatch(
+        r"/users/(\d+)/profile/?",
+        unquote(parsed.path),
+        re.IGNORECASE,
+    )
+    return match.group(1) if match else None
+
+
+def _roblox_error_404_url(value):
+    if not isinstance(value, str) or not value:
+        return False
+    parsed = urlparse(value)
+    return (
+        parsed.scheme in ("http", "https")
+        and parsed.netloc.casefold() in ("roblox.com", "www.roblox.com")
+        and unquote(parsed.path).rstrip("/").casefold() == "/request-error"
+        and "code=404" in parsed.query.casefold().split("&")
+    )
+
+
+def classify_roblox_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(response, "Roblox")
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    canonical_url = _public_profile_canonical(soup)
+    og_url = _public_profile_meta(soup, "property", "og:url")
+    og_title = _public_profile_meta(soup, "property", "og:title")
+    og_type = _public_profile_meta(soup, "property", "og:type")
+    expected_username = username.casefold()
+
+    final_id = _roblox_profile_id(response.url)
+    canonical_id = _roblox_profile_id(canonical_url)
+    og_id = _roblox_profile_id(og_url)
+    marker_nodes = soup.select(
+        '.profile-platform-container[data-profile-type="User"]'
+    )
+    marker_ids = {
+        str(node.get("data-profile-id", ""))
+        for node in marker_nodes
+        if node.get("data-profile-id")
+    }
+    stable_ids = {
+        value for value in (final_id, canonical_id, og_id, *marker_ids) if value
+    }
+
+    title_match = re.fullmatch(r"(.+)\s+-\s+Roblox", title, re.IGNORECASE)
+    title_username = title_match.group(1).casefold() if title_match else ""
+    og_title_match = re.fullmatch(
+        r"(.+?)(?:'|’|&#39;)s Profile",
+        og_title,
+        re.IGNORECASE,
+    )
+    og_username = (
+        og_title_match.group(1).casefold() if og_title_match else ""
+    )
+    public_usernames = {
+        value for value in (title_username, og_username) if value
+    }
+
+    profile_evidence = any((
+        final_id,
+        canonical_id,
+        og_id,
+        marker_ids,
+        og_type.casefold() == "profile",
+    ))
+    if (
+        response.status_code == 404
+        and _roblox_error_404_url(response.url)
+        and title.casefold() == "roblox"
+        and not profile_evidence
+    ):
+        return NOT_FOUND, None, "public Roblox username or profile not found"
+
+    conflicts = (
+        bool(response.url and not final_id),
+        bool(canonical_url and not canonical_id),
+        bool(og_url and not og_id),
+        len(stable_ids) > 1,
+        any(not value.isdigit() for value in stable_ids),
+        bool(public_usernames and public_usernames != {expected_username}),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "Roblox profile evidence conflict"
+
+    if response.status_code >= 400:
+        return UNKNOWN, None, f"unconfirmed Roblox HTTP {response.status_code}"
+    if response.status_code != 200 or not final_id:
+        return UNKNOWN, None, "unexpected Roblox final URL"
+
+    if (
+        canonical_id == final_id
+        and og_id == final_id
+        and marker_ids == {final_id}
+        and public_usernames == {expected_username}
+        and og_type.casefold() == "profile"
+        and len(marker_nodes) == 1
+    ):
+        return (
+            FOUND,
+            response.url,
+            "public Roblox profile found; identity not verified",
+        )
+
+    return POSSIBLE, response.url, "incomplete Roblox public profile evidence"
+
+
+# ============================================================
+# SPECJALNA DETEKCJA PROFILI FLICKR
+# ============================================================
+
+def _flickr_profile_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        ("flickr.com", "www.flickr.com"),
+        f"/people/{username}",
+    )
+
+
+def _flickr_profile_state(soup):
+    for node in soup.find_all("script"):
+        script = node.string or node.get_text()
+        if "profile-page-view" not in script:
+            continue
+        marker = re.search(r"\bparams\s*:\s*", script)
+        if not marker:
+            continue
+        try:
+            value, _ = json.JSONDecoder().raw_decode(script[marker.end():])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
+def _flickr_photo_path_matches(value, username):
+    if not isinstance(value, str) or not value:
+        return False
+    if value.startswith("/"):
+        return (
+            unquote(value).rstrip("/").casefold()
+            == f"/photos/{username}".casefold()
+        )
+    return _public_profile_url_matches(
+        value,
+        ("flickr.com", "www.flickr.com"),
+        f"/photos/{username}",
+    )
+
+
+def classify_flickr_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(response, "Flickr")
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    canonical_url = _public_profile_canonical(soup)
+    og_url = _public_profile_meta(soup, "property", "og:url")
+    og_type = _public_profile_meta(soup, "property", "og:type")
+    expected_username = username.casefold()
+    final_matches = _flickr_profile_url_matches(response.url, username)
+    canonical_matches = _flickr_profile_url_matches(canonical_url, username)
+    og_url_matches = _flickr_profile_url_matches(og_url, username)
+
+    state = _flickr_profile_state(soup)
+    person = state.get("personModel", {}) if isinstance(state, dict) else {}
+    if not isinstance(person, dict):
+        person = {}
+    state_alias = str(state.get("pathAlias", "")).casefold()
+    person_alias = str(person.get("pathAlias", "")).casefold()
+    public_aliases = {value for value in (state_alias, person_alias) if value}
+    state_nsid = str(state.get("nsid", ""))
+    person_nsid = str(person.get("nsid", ""))
+    stable_ids = {value for value in (state_nsid, person_nsid) if value}
+    photo_url = str(person.get("url", ""))
+
+    conflicts = (
+        bool(response.url and not final_matches),
+        bool(canonical_url and not canonical_matches),
+        bool(og_url and not og_url_matches),
+        bool(public_aliases and public_aliases != {expected_username}),
+        len(stable_ids) > 1,
+        any(not re.fullmatch(r"\d+@N\d+", value) for value in stable_ids),
+        bool(photo_url and not _flickr_photo_path_matches(photo_url, username)),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "Flickr profile evidence conflict"
+
+    profile_evidence = any((canonical_url, og_url, state, stable_ids))
+    structural_404 = bool(
+        soup.html
+        and any(
+            value in ("fluid-error-page-view", "html-fluid-error-page-view")
+            for value in soup.html.get("class", [])
+        )
+    )
+    if (
+        response.status_code == 404
+        and final_matches
+        and title.casefold() == "flickr"
+        and structural_404
+        and not profile_evidence
+    ):
+        return NOT_FOUND, None, "public Flickr profile not found"
+
+    if response.status_code >= 400:
+        return UNKNOWN, None, f"unconfirmed Flickr HTTP {response.status_code}"
+    if response.status_code != 200 or not final_matches:
+        return UNKNOWN, None, "unexpected Flickr final URL"
+
+    profile_marker = bool(state and person)
+    if (
+        canonical_matches
+        and og_url_matches
+        and og_type.casefold() == "article"
+        and title.casefold().startswith("about ")
+        and title.casefold().endswith(" | flickr")
+        and public_aliases == {expected_username}
+        and len(stable_ids) == 1
+        and _flickr_photo_path_matches(photo_url, username)
+        and profile_marker
+    ):
+        return (
+            FOUND,
+            profile_url,
+            "public Flickr profile found; identity not verified",
+        )
+
+    return POSSIBLE, profile_url, "incomplete Flickr public profile evidence"
+
+
+# ============================================================
+# SPECJALNA DETEKCJA PROFILI PATREON
+# ============================================================
+
+def _patreon_profile_path(value):
+    if not isinstance(value, str) or not value:
+        return None
+    parsed = urlparse(value)
+    if (
+        parsed.scheme not in ("http", "https")
+        or parsed.netloc.casefold() not in ("patreon.com", "www.patreon.com")
+    ):
+        return None
+    parts = [part for part in unquote(parsed.path).split("/") if part]
+    if len(parts) == 1:
+        return f"/{parts[0].casefold()}"
+    if len(parts) == 2 and parts[0].casefold() in ("c", "cw"):
+        return f"/{parts[0].casefold()}/{parts[1].casefold()}"
+    return None
+
+
+def _patreon_requested_profile_matches(value, username):
+    path = _patreon_profile_path(value)
+    if not path:
+        return False
+    return path.split("/")[-1] == username.casefold()
+
+
+def _patreon_campaign_id(value):
+    if not isinstance(value, str):
+        return None
+    match = re.search(
+        r"/(?:campaign|creator)/(\d+)(?:[./?]|$)",
+        value,
+        re.IGNORECASE,
+    )
+    return match.group(1) if match else None
+
+
+def classify_patreon_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(response, "Patreon")
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    canonical_url = _public_profile_canonical(soup)
+    og_url = _public_profile_meta(soup, "property", "og:url")
+    og_title = _public_profile_meta(soup, "property", "og:title")
+    og_type = _public_profile_meta(soup, "property", "og:type")
+    og_image = _public_profile_meta(soup, "property", "og:image")
+    profile_username = _public_profile_meta(
+        soup,
+        "property",
+        "profile:username",
+    ).casefold()
+    expected_username = username.casefold()
+
+    final_path = _patreon_profile_path(response.url)
+    canonical_path = _patreon_profile_path(canonical_url)
+    og_path = _patreon_profile_path(og_url)
+    current_paths = {
+        value for value in (final_path, canonical_path, og_path) if value
+    }
+
+    profile_pages = [
+        item
+        for document in _public_json_ld_documents(soup)
+        for item in _walk_public_json(document)
+        if item.get("@type") == "ProfilePage"
+    ]
+    people = [
+        item.get("mainEntity")
+        for item in profile_pages
+        if isinstance(item.get("mainEntity"), dict)
+        and item["mainEntity"].get("@type") == "Person"
+    ]
+    schema_usernames = {
+        str(item.get("alternateName", "")).casefold()
+        for item in people
+        if item.get("alternateName")
+    }
+    schema_urls = {
+        str(value)
+        for item in (*profile_pages, *people)
+        for value in (item.get("@id"), item.get("url"))
+        if value
+    }
+    campaign_ids = {
+        value
+        for item in people
+        for nested in _walk_public_json(item)
+        for raw_value in nested.values()
+        for value in (_patreon_campaign_id(raw_value),)
+        if value
+    }
+    og_campaign_id = _patreon_campaign_id(og_image)
+    if og_campaign_id:
+        campaign_ids.add(og_campaign_id)
+
+    requested_schema_urls = all(
+        _patreon_requested_profile_matches(value, username)
+        for value in schema_urls
+    ) if schema_urls else False
+    requested_final = _patreon_requested_profile_matches(
+        response.url,
+        username,
+    )
+    exact_request_final = _public_profile_url_matches(
+        response.url,
+        ("patreon.com", "www.patreon.com"),
+        f"/{username}",
+    )
+
+    profile_marker = bool(
+        soup.find("h1", attrs={"data-is-key-element": "true"})
+        or soup.find("h1", attrs={"elementtiming": re.compile("Creator Name")})
+    )
+    profile_evidence = any((
+        canonical_url,
+        og_url,
+        profile_pages,
+        people,
+        profile_username,
+        campaign_ids,
+        profile_marker,
+    ))
+    if (
+        response.status_code == 404
+        and exact_request_final
+        and title.casefold() == "not found | patreon"
+        and og_type.casefold() == "article"
+        and not profile_evidence
+    ):
+        return NOT_FOUND, None, "public Patreon profile not found"
+
+    conflicts = (
+        bool(response.url and not final_path),
+        bool(canonical_url and not canonical_path),
+        bool(og_url and not og_path),
+        len(current_paths) > 1,
+        bool(profile_username and profile_username != expected_username),
+        bool(schema_usernames and schema_usernames != {expected_username}),
+        bool(schema_urls and not requested_schema_urls),
+        len(campaign_ids) > 1,
+        any(not value.isdigit() for value in campaign_ids),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "Patreon profile evidence conflict"
+
+    if response.status_code >= 400:
+        return UNKNOWN, None, f"unconfirmed Patreon HTTP {response.status_code}"
+    if response.status_code != 200 or not final_path:
+        return UNKNOWN, None, "unexpected Patreon final URL"
+
+    title_matches = bool(title and og_title and title.startswith(og_title))
+    redirect_linked = bool(
+        requested_final
+        or (
+            schema_usernames == {expected_username}
+            and requested_schema_urls
+            and profile_username == expected_username
+        )
+    )
+    if (
+        len(current_paths) == 1
+        and redirect_linked
+        and og_type.casefold() == "profile"
+        and title_matches
+        and len(profile_pages) == 1
+        and len(people) == 1
+        and schema_usernames == {expected_username}
+        and requested_schema_urls
+        and profile_username == expected_username
+        and len(campaign_ids) == 1
+        and profile_marker
+    ):
+        return (
+            FOUND,
+            response.url,
+            "public Patreon profile found; identity not verified",
+        )
+
+    if not requested_final and not redirect_linked:
+        return UNKNOWN, None, "Patreon redirect is not linked to the requested username"
+
+    return POSSIBLE, response.url, "incomplete Patreon public profile evidence"
+
+
+# ============================================================
+# SPECJALNA DETEKCJA PROFILI THEMEFOREST
+# ============================================================
+
+def _themeforest_profile_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        ("themeforest.net", "www.themeforest.net"),
+        f"/user/{username}",
+    )
+
+
+def _themeforest_404_url(value, username):
+    if not isinstance(value, str) or not value:
+        return False
+    parsed = urlparse(value)
+    return (
+        parsed.scheme in ("http", "https")
+        and parsed.netloc.casefold() in ("themeforest.net", "www.themeforest.net")
+        and unquote(parsed.path).rstrip("/").casefold() == "/404"
+        and f"username={username}".casefold() in parsed.query.casefold().split("&")
+    )
+
+
+def classify_themeforest_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(response, "ThemeForest")
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    canonical_url = _public_profile_canonical(soup)
+    og_url = _public_profile_meta(soup, "property", "og:url")
+    og_title = _public_profile_meta(soup, "property", "og:title")
+    expected_username = username.casefold()
+    final_matches = _themeforest_profile_url_matches(response.url, username)
+    canonical_matches = _themeforest_profile_url_matches(canonical_url, username)
+    og_url_matches = _themeforest_profile_url_matches(og_url, username)
+
+    profile_header = soup.select_one(".user-info-header")
+    heading = profile_header.find("h1") if profile_header else None
+    heading_username = (
+        heading.get_text(" ", strip=True).casefold() if heading else ""
+    )
+    profile_links = {
+        str(node.get("href"))
+        for node in soup.select(".user-info-header a[href], .user-info-header__tabs--elite-author a[href]")
+        if node.get("href")
+    }
+    matching_profile_links = {
+        value
+        for value in profile_links
+        if _themeforest_profile_url_matches(value, username)
+        or _public_profile_url_matches(
+            urljoin("https://themeforest.net", value),
+            ("themeforest.net", "www.themeforest.net"),
+            f"/user/{username}/portfolio",
+        )
+    }
+    author_ids = {
+        str(node.get("data-author-id"))
+        for node in soup.select("[data-author-id]")
+        if node.get("data-author-id") not in (None, "")
+    }
+    title_match = re.fullmatch(
+        r"(.+?)(?:'|’)s profile on ThemeForest",
+        title,
+        re.IGNORECASE,
+    )
+    og_title_match = re.fullmatch(
+        r"(.+?)(?:'|’)s profile on ThemeForest",
+        og_title,
+        re.IGNORECASE,
+    )
+    public_usernames = {
+        match.group(1).casefold()
+        for match in (title_match, og_title_match)
+        if match
+    }
+    if heading_username:
+        public_usernames.add(heading_username)
+
+    profile_evidence = any((profile_header, heading, author_ids))
+    if (
+        response.status_code == 404
+        and final_matches
+        and title.casefold() == "page not found | themeforest"
+        and _themeforest_404_url(canonical_url, username)
+        and _themeforest_404_url(og_url, username)
+        and not profile_evidence
+    ):
+        return NOT_FOUND, None, "public ThemeForest author profile not found"
+
+    conflicts = (
+        bool(response.url and not final_matches),
+        bool(canonical_url and not canonical_matches),
+        bool(og_url and not og_url_matches),
+        bool(public_usernames and public_usernames != {expected_username}),
+        len(author_ids) > 1,
+        any(not value.isdigit() for value in author_ids),
+        bool(profile_links and not matching_profile_links),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "ThemeForest author profile evidence conflict"
+
+    if response.status_code >= 400:
+        return UNKNOWN, None, f"unconfirmed ThemeForest HTTP {response.status_code}"
+    if response.status_code != 200 or not final_matches:
+        return UNKNOWN, None, "unexpected ThemeForest final URL"
+
+    if (
+        canonical_matches
+        and og_url_matches
+        and public_usernames == {expected_username}
+        and profile_header is not None
+        and heading is not None
+        and bool(matching_profile_links)
+    ):
+        return (
+            FOUND,
+            profile_url,
+            "public ThemeForest author profile found; identity not verified",
+        )
+
+    return POSSIBLE, profile_url, "incomplete ThemeForest author profile evidence"
+
+
+# ============================================================
 # SPRAWDZANIE JEDNEGO SERWISU
 # ============================================================
 
@@ -5774,6 +6477,51 @@ def check_username_on_site(username, site_name, site_config):
 
         if checker == "disqus_profile":
             status, link, info = classify_disqus_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "chesscom_profile":
+            status, link, info = classify_chesscom_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "roblox_profile":
+            status, link, info = classify_roblox_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "flickr_profile":
+            status, link, info = classify_flickr_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "patreon_profile":
+            status, link, info = classify_patreon_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "themeforest_profile":
+            status, link, info = classify_themeforest_profile_response(
                 username,
                 response,
                 url,

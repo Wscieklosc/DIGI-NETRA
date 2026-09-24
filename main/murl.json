@@ -474,6 +474,7 @@
   },
   "Chess.com": {
     "url": "https://www.chess.com/member/{username}",
+    "checker": "chesscom_profile",
     "detect_based_on_message": false,
     "not_found_status_codes": [404],
     "not_found_message": "This page doesn't exist.",
@@ -491,6 +492,7 @@
   },
     "Roblox": {
     "url": "https://www.roblox.com/user.aspx?username={username}",
+    "checker": "roblox_profile",
     "detect_based_on_message": false,
     "not_found_status_codes": [404],
     "not_found_message": "This page doesn't exist.",
@@ -861,6 +863,7 @@
   },
   "Flickr": {
     "url": "https://www.flickr.com/people/{username}",
+    "checker": "flickr_profile",
     "detect_based_on_message": true,
     "not_found_status_codes": [404],
     "not_found_message": "Page Not Found",
@@ -1259,6 +1262,7 @@
   },
   "Patreon": {
     "url": "https://www.patreon.com/{username}",
+    "checker": "patreon_profile",
     "detect_based_on_message": true,
     "not_found_status_codes": [404],
     "not_found_message": "Page Not Found",
@@ -1430,6 +1434,7 @@
   },
   "ThemeForest": {
     "url": "https://themeforest.net/user/{username}",
+    "checker": "themeforest_profile",
     "detect_based_on_message": true,
     "not_found_status_codes": [404],
     "not_found_message": "Page Not Found",

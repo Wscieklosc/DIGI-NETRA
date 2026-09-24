@@ -4000,5 +4000,460 @@ class SecondPublicProfileCheckerConfigTests(unittest.TestCase):
                 self.assertEqual(config[service_name]["checker"], checker)
 
 
+class ChessComProfileDetectionTests(
+    PublicProfileCheckerMixin,
+    unittest.TestCase,
+):
+    site_name = "Chess.com"
+    default_url = "https://www.chess.com/member/Test_User"
+    site_config = {
+        "url": "https://www.chess.com/member/{username}",
+        "checker": "chesscom_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def profile_html(
+        self,
+        *,
+        public_username="Test_User",
+        dom_id="12345",
+        script_id="12345",
+        include_script=True,
+    ):
+        script = ""
+        if include_script:
+            script = f'''<script>
+                window.chesscom.user = {{
+                    userId: {script_id},
+                    username: "{public_username}",
+                    uuid: "11111111-2222-3333-4444-555555555555",
+                }};
+            </script>'''
+        return f"""
+            <html><head>
+                <title>GM Test Name ({public_username}) - Chess Profile - Chess.com</title>
+                <link rel="canonical" href="https://www.chess.com/member/{public_username}">
+                <meta property="og:url" content="https://www.chess.com/member/{public_username}">
+                <meta property="og:title" content="GM Test Name ({public_username}) - Chess Profile">
+            </head><body>
+                <div class="profile-header-container" data-username="{public_username}"
+                     data-user-id="{dom_id}"
+                     data-user-uuid="11111111-2222-3333-4444-555555555555">
+                    <div class="profile-header"></div>
+                </div>
+                <div id="view-profile" data-username="{public_username}"
+                     data-user-id="{dom_id}"
+                     data-user-uuid="11111111-2222-3333-4444-555555555555"></div>
+                {script}
+            </body></html>
+        """
+
+    def test_chesscom_certain_found(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html()))[1], FOUND)
+
+    def test_chesscom_confirmed_404_is_not_found(self):
+        html = "<html><head><title>Missing Page - Chess.com</title></head></html>"
+        self.assertEqual(self.check(self.response(404, html))[1], NOT_FOUND)
+
+    def test_chesscom_username_conflict_is_unknown(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html(public_username="Other_User")))[1],
+            UNKNOWN,
+        )
+
+    def test_chesscom_url_conflict_is_unknown(self):
+        response = self.response(200, self.profile_html(), url="https://www.chess.com/member/Other_User")
+        self.assertEqual(self.check(response)[1], UNKNOWN)
+
+    def test_chesscom_stable_id_conflict_is_unknown(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html(script_id="98765")))[1],
+            UNKNOWN,
+        )
+
+    def test_chesscom_incomplete_data_is_possible(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html(include_script=False)))[1],
+            POSSIBLE,
+        )
+
+    def test_chesscom_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_chesscom_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+
+class RobloxProfileDetectionTests(
+    PublicProfileCheckerMixin,
+    unittest.TestCase,
+):
+    site_name = "Roblox"
+    default_url = "https://www.roblox.com/users/12345/profile"
+    site_config = {
+        "url": "https://www.roblox.com/user.aspx?username={username}",
+        "checker": "roblox_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def profile_html(
+        self,
+        *,
+        public_username="Test_User",
+        url_id="12345",
+        marker_id="12345",
+        include_marker=True,
+    ):
+        marker = ""
+        if include_marker:
+            marker = (
+                '<div class="profile-platform-container" '
+                f'data-profile-type="User" data-profile-id="{marker_id}"></div>'
+            )
+        return f"""
+            <html><head>
+                <title>{public_username} - Roblox</title>
+                <link rel="canonical" href="https://www.roblox.com/users/{url_id}/profile">
+                <meta property="og:url" content="https://www.roblox.com/users/{url_id}/profile">
+                <meta property="og:type" content="profile">
+                <meta property="og:title" content="{public_username}'s Profile">
+            </head><body>{marker}</body></html>
+        """
+
+    def test_roblox_certain_found_after_resolver_redirect(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html()))[1], FOUND)
+
+    def test_roblox_confirmed_request_error_is_not_found(self):
+        response = self.response(
+            404,
+            "<html><head><title>Roblox</title></head></html>",
+            url="https://www.roblox.com/request-error?code=404",
+        )
+        self.assertEqual(self.check(response)[1], NOT_FOUND)
+
+    def test_roblox_username_conflict_is_unknown(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html(public_username="Other_User")))[1],
+            UNKNOWN,
+        )
+
+    def test_roblox_url_conflict_is_unknown(self):
+        response = self.response(
+            200,
+            self.profile_html(),
+            url="https://www.roblox.com/users/98765/profile",
+        )
+        self.assertEqual(self.check(response)[1], UNKNOWN)
+
+    def test_roblox_stable_id_conflict_is_unknown(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html(marker_id="98765")))[1],
+            UNKNOWN,
+        )
+
+    def test_roblox_incomplete_data_is_possible(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html(include_marker=False)))[1],
+            POSSIBLE,
+        )
+
+    def test_roblox_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_roblox_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+
+class FlickrProfileDetectionTests(
+    PublicProfileCheckerMixin,
+    unittest.TestCase,
+):
+    site_name = "Flickr"
+    default_url = "https://www.flickr.com/people/Test_User"
+    site_config = {
+        "url": "https://www.flickr.com/people/{username}",
+        "checker": "flickr_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def profile_html(
+        self,
+        *,
+        public_username="Test_User",
+        state_nsid="12345@N01",
+        person_nsid="12345@N01",
+        include_canonical=True,
+    ):
+        canonical = (
+            f'<link rel="canonical" href="https://www.flickr.com/people/{public_username}/">'
+            if include_canonical else ""
+        )
+        state = {
+            "pathAlias": public_username,
+            "nsid": state_nsid,
+            "personModel": {
+                "pathAlias": public_username,
+                "username": "Display Name",
+                "nsid": person_nsid,
+                "url": f"/photos/{public_username}/",
+            },
+        }
+        return f"""
+            <html><head>
+                <title>About Display Name | Flickr</title>
+                {canonical}
+                <meta property="og:url" content="https://www.flickr.com/people/{public_username}/">
+                <meta property="og:type" content="article">
+            </head><body><script>
+                app = {{
+                    name: 'profile-page-view',
+                    params: {json.dumps(state)},
+                    layout: 'scrolling'
+                }};
+            </script></body></html>
+        """
+
+    def test_flickr_certain_found(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html()))[1], FOUND)
+
+    def test_flickr_confirmed_structural_404_is_not_found(self):
+        html = '<html class="html-fluid-error-page-view"><head><title>Flickr</title></head></html>'
+        self.assertEqual(self.check(self.response(404, html))[1], NOT_FOUND)
+
+    def test_flickr_username_conflict_is_unknown(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html(public_username="Other_User")))[1],
+            UNKNOWN,
+        )
+
+    def test_flickr_url_conflict_is_unknown(self):
+        response = self.response(200, self.profile_html(), url="https://www.flickr.com/people/Other_User")
+        self.assertEqual(self.check(response)[1], UNKNOWN)
+
+    def test_flickr_stable_id_conflict_is_unknown(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html(person_nsid="98765@N01")))[1],
+            UNKNOWN,
+        )
+
+    def test_flickr_missing_canonical_is_possible(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html(include_canonical=False)))[1],
+            POSSIBLE,
+        )
+
+    def test_flickr_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_flickr_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+
+class PatreonProfileDetectionTests(
+    PublicProfileCheckerMixin,
+    unittest.TestCase,
+):
+    site_name = "Patreon"
+    default_url = "https://www.patreon.com/cw/Test_User"
+    site_config = {
+        "url": "https://www.patreon.com/{username}",
+        "checker": "patreon_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def profile_html(
+        self,
+        *,
+        public_username="Test_User",
+        current_username="Test_User",
+        schema_id="12345",
+        og_id="12345",
+        include_schema=True,
+    ):
+        schema = ""
+        if include_schema:
+            data = {
+                "@type": "ProfilePage",
+                "@id": f"https://www.patreon.com/{public_username}#profilepage",
+                "mainEntity": {
+                    "@type": "Person",
+                    "@id": f"https://www.patreon.com/{public_username}#person",
+                    "url": f"https://www.patreon.com/{public_username}",
+                    "alternateName": public_username,
+                    "name": "Test Creator",
+                    "image": {
+                        "contentUrl": (
+                            "https://c10.patreonusercontent.com/4/patreon-media/"
+                            f"p/campaign/{schema_id}/image.png"
+                        ),
+                    },
+                },
+            }
+            schema = f'<script type="application/ld+json">{json.dumps(data)}</script>'
+        current_url = f"https://www.patreon.com/cw/{current_username}"
+        return f"""
+            <html><head>
+                <title>Test Creator | Patreon</title>
+                <link rel="canonical" href="{current_url}">
+                <meta property="og:url" content="{current_url}">
+                <meta property="og:type" content="profile">
+                <meta property="og:title" content="Test Creator">
+                <meta property="og:image" content="https://www.patreon.com/ig/card-teaser-image/creator/{og_id}.png">
+                <meta property="profile:username" content="{public_username}">
+                {schema}
+            </head><body>
+                <h1 data-is-key-element="true" elementtiming="Creator World : Home tab : Creator Name">Test Creator</h1>
+            </body></html>
+        """
+
+    def test_patreon_certain_found_after_cw_redirect(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html()))[1], FOUND)
+
+    def test_patreon_confirmed_404_is_not_found(self):
+        html = '<html><head><title>Not found | Patreon</title><meta property="og:type" content="article"></head></html>'
+        response = self.response(404, html, url="https://www.patreon.com/Test_User")
+        self.assertEqual(self.check(response)[1], NOT_FOUND)
+
+    def test_patreon_username_conflict_is_unknown(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html(public_username="Other_User")))[1],
+            UNKNOWN,
+        )
+
+    def test_patreon_url_conflict_is_unknown(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html(current_username="Other_User")))[1],
+            UNKNOWN,
+        )
+
+    def test_patreon_stable_id_conflict_is_unknown(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html(og_id="98765")))[1],
+            UNKNOWN,
+        )
+
+    def test_patreon_incomplete_data_is_possible(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html(include_schema=False)))[1],
+            POSSIBLE,
+        )
+
+    def test_patreon_unlinked_redirect_is_unknown(self):
+        response = self.response(
+            200,
+            self.profile_html(public_username="Other_User", current_username="Other_User"),
+            url="https://www.patreon.com/cw/Other_User",
+        )
+        self.assertEqual(self.check(response)[1], UNKNOWN)
+
+    def test_patreon_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_patreon_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+
+class ThemeForestProfileDetectionTests(
+    PublicProfileCheckerMixin,
+    unittest.TestCase,
+):
+    site_name = "ThemeForest"
+    default_url = "https://themeforest.net/user/Test_User"
+    site_config = {
+        "url": "https://themeforest.net/user/{username}",
+        "checker": "themeforest_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def profile_html(
+        self,
+        *,
+        public_username="Test_User",
+        canonical_username="Test_User",
+        author_ids=(),
+        include_header=True,
+    ):
+        author_markers = "".join(
+            f'<span data-author-id="{author_id}"></span>'
+            for author_id in author_ids
+        )
+        header = ""
+        if include_header:
+            header = f"""
+                <div class="user-info-header">
+                    <h1>{public_username}</h1>
+                    <a href="/user/{public_username}">Profile</a>
+                    <a href="/user/{public_username}/portfolio">View Portfolio</a>
+                    {author_markers}
+                </div>
+            """
+        return f"""
+            <html><head>
+                <title>{public_username}'s profile on ThemeForest</title>
+                <link rel="canonical" href="https://themeforest.net/user/{canonical_username}">
+                <meta property="og:url" content="https://themeforest.net/user/{canonical_username}">
+                <meta property="og:title" content="{public_username}'s profile on ThemeForest">
+            </head><body>{header}</body></html>
+        """
+
+    def test_themeforest_certain_found(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html()))[1], FOUND)
+
+    def test_themeforest_confirmed_404_is_not_found(self):
+        error_url = "https://themeforest.net/404?username=Test_User"
+        html = f"""
+            <html><head><title>Page Not Found | ThemeForest</title>
+            <link rel="canonical" href="{error_url}">
+            <meta property="og:url" content="{error_url}"></head></html>
+        """
+        self.assertEqual(self.check(self.response(404, html))[1], NOT_FOUND)
+
+    def test_themeforest_username_conflict_is_unknown(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html(public_username="Other_User")))[1],
+            UNKNOWN,
+        )
+
+    def test_themeforest_url_conflict_is_unknown(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html(canonical_username="Other_User")))[1],
+            UNKNOWN,
+        )
+
+    def test_themeforest_stable_id_conflict_is_unknown(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html(author_ids=("123", "987"))))[1],
+            UNKNOWN,
+        )
+
+    def test_themeforest_incomplete_data_is_possible(self):
+        self.assertEqual(
+            self.check(self.response(200, self.profile_html(include_header=False)))[1],
+            POSSIBLE,
+        )
+
+    def test_themeforest_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_themeforest_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+
+class ThirdPublicProfileCheckerConfigTests(unittest.TestCase):
+    def test_five_services_use_dedicated_checkers(self):
+        config = load_sites_config()
+        expected = {
+            "Chess.com": "chesscom_profile",
+            "Roblox": "roblox_profile",
+            "Flickr": "flickr_profile",
+            "Patreon": "patreon_profile",
+            "ThemeForest": "themeforest_profile",
+        }
+
+        for service_name, checker in expected.items():
+            with self.subTest(service=service_name):
+                self.assertEqual(config[service_name]["checker"], checker)
+
+
 if __name__ == "__main__":
     unittest.main()
