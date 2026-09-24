@@ -5650,6 +5650,350 @@ class HouzzProfileDetectionTests(PublicProfileCheckerMixin, unittest.TestCase):
         self.assertEqual(self.check(self.response(500))[1], ERROR)
 
 
+class MyspaceProfileDetectionTests(PublicProfileCheckerMixin, unittest.TestCase):
+    site_name = "Myspace"
+    default_url = "https://myspace.com/Test_User"
+    site_config = {
+        "url": "https://myspace.com/{username}",
+        "checker": "myspace_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def profile_html(
+        self,
+        *,
+        public_username="Test_User",
+        canonical_username="Test_User",
+        profile_id="29122115",
+        dom_profile_id=None,
+        artist_id="41742275",
+        include_context=True,
+        pfc="Profile",
+    ):
+        dom_profile_id = dom_profile_id or profile_id
+        context = {
+            "text": {},
+            "displayProfileId": int(profile_id) if profile_id.isdigit() else profile_id,
+            "artistId": int(artist_id) if artist_id.isdigit() else artist_id,
+            "pfc": pfc,
+            "streamUrl": f"/ajax/{public_username}/latest/all",
+            "filterStreamUrl": f"/ajax/{public_username}/latest/",
+            "hasProfileDetails": True,
+        }
+        context_script = (
+            f"<script>context = {json.dumps(context)};</script>"
+            if include_context
+            else ""
+        )
+        return f'''
+            <html><head><title>Test Name ({public_username}) on Myspace</title>
+            <link rel="canonical" href="https://myspace.com/{canonical_username}">
+            <meta property="og:url" content="https://myspace.com/{canonical_username}">
+            <meta property="og:title" content="Test Name ({public_username}) on Myspace">
+            <meta property="og:type" content="profile">
+            <meta name="description" content="Test Name ({public_username})'s profile on Myspace."></head>
+            <body class="unifiedNav profile sidebar"><h1>Test Name</h1>
+            <div class="connectButton" data-id="{dom_profile_id}" data-artist-id="{artist_id}"></div>
+            {context_script}</body></html>
+        '''
+
+    def test_myspace_certain_found(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html()))[1], FOUND)
+
+    def test_myspace_normalizing_trailing_slash_redirect_is_found(self):
+        response = self.response(200, self.profile_html(), "https://myspace.com/Test_User/")
+        self.assertEqual(self.check(response)[1], FOUND)
+
+    def test_myspace_confirmed_404_is_not_found(self):
+        context = {"text": {}, "pfc": "404"}
+        html = f'<html><head><title>Myspace</title></head><body class="unifiedNav"><h1>Page Not Found</h1><script>context = {json.dumps(context)};</script></body></html>'
+        self.assertEqual(self.check(self.response(404, html))[1], NOT_FOUND)
+
+    def test_myspace_username_conflict_is_unknown(self):
+        html = self.profile_html(public_username="Other_User")
+        self.assertEqual(self.check(self.response(200, html))[1], UNKNOWN)
+
+    def test_myspace_url_conflict_is_unknown(self):
+        html = self.profile_html(canonical_username="Other_User")
+        self.assertEqual(self.check(self.response(200, html))[1], UNKNOWN)
+
+    def test_myspace_stable_id_conflict_is_unknown(self):
+        html = self.profile_html(dom_profile_id="99999999")
+        self.assertEqual(self.check(self.response(200, html))[1], UNKNOWN)
+
+    def test_myspace_incomplete_data_is_possible(self):
+        html = self.profile_html(include_context=False)
+        self.assertEqual(self.check(self.response(200, html))[1], POSSIBLE)
+
+    def test_myspace_soft_error_200_is_unknown(self):
+        html = self.profile_html(pfc="404")
+        self.assertEqual(self.check(self.response(200, html))[1], UNKNOWN)
+
+    def test_myspace_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_myspace_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+    def test_myspace_5xx_is_error(self):
+        self.assertEqual(self.check(self.response(503))[1], ERROR)
+
+
+class HubPagesProfileDetectionTests(PublicProfileCheckerMixin, unittest.TestCase):
+    site_name = "HubPages"
+    default_url = "https://hubpages.com/@Test_User"
+    site_config = {
+        "url": "https://hubpages.com/@{username}",
+        "checker": "hubpages_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def profile_html(
+        self,
+        *,
+        public_username="Test_User",
+        profile_id="2256391",
+        tracking_id=None,
+        include_marker=True,
+    ):
+        tracking_id = tracking_id or profile_id
+        page_values = {
+            "cm": "hubpages",
+            "hp_site": "hubpages",
+            "pagetype": "profile",
+            "path": f"/@{public_username}",
+            "contentitemid": f"hp-profile-{profile_id}",
+            "loggedin": "0",
+        }
+        marker = '<div class="bio_stats"><h1><span class="author_primary_name">Test Name</span> <span class="author_secondary_name">(Display Name)</span></h1></div>' if include_marker else "<h1>Test Name</h1>"
+        return f'''
+            <html><head><title>Test Name on HubPages</title></head>
+            <body class="hubpages profilepage">{marker}
+            <script>var hpstdata = {{ hp_tracking_type: 'p', hp_tracking_id: {tracking_id}, tracking: '' }};</script>
+            <script>window.pageKeyValues = {json.dumps(page_values)};</script>
+            <script>const request = {{ section: 'articles', uId: {profile_id} }};</script>
+            </body></html>
+        '''
+
+    def test_hubpages_certain_found(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html()))[1], FOUND)
+
+    def test_hubpages_confirmed_404_is_not_found(self):
+        html = '<html><head><title>Page Not Found</title></head><body><h1>404. Page does not exist</h1></body></html>'
+        self.assertEqual(self.check(self.response(404, html))[1], NOT_FOUND)
+
+    def test_hubpages_username_conflict_is_unknown(self):
+        html = self.profile_html(public_username="Other_User")
+        self.assertEqual(self.check(self.response(200, html))[1], UNKNOWN)
+
+    def test_hubpages_url_conflict_is_unknown(self):
+        response = self.response(200, self.profile_html(), "https://hubpages.com/@Other_User")
+        self.assertEqual(self.check(response)[1], UNKNOWN)
+
+    def test_hubpages_stable_id_conflict_is_unknown(self):
+        html = self.profile_html(tracking_id="9999999")
+        self.assertEqual(self.check(self.response(200, html))[1], UNKNOWN)
+
+    def test_hubpages_incomplete_data_is_possible(self):
+        html = self.profile_html(include_marker=False)
+        self.assertEqual(self.check(self.response(200, html))[1], POSSIBLE)
+
+    def test_hubpages_soft_404_200_is_unknown(self):
+        html = '<html><head><title>Page Not Found</title></head><body><h1>404. Page does not exist</h1></body></html>'
+        self.assertEqual(self.check(self.response(200, html))[1], UNKNOWN)
+
+    def test_hubpages_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_hubpages_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+    def test_hubpages_5xx_is_error(self):
+        self.assertEqual(self.check(self.response(500))[1], ERROR)
+
+
+class GabProfileDetectionTests(unittest.TestCase):
+    username = "Test_User"
+    site_name = "Gab"
+    site_config = {
+        "url": "https://gab.com/{username}",
+        "checker": "gab_profile",
+        "rate_limit_delay": 0,
+    }
+    account_id = "123"
+
+    def response(self, status_code, text="", url=None, json_data=None):
+        response = Mock()
+        response.status_code = status_code
+        response.text = text
+        response.url = url or "https://gab.com/Test_User"
+        if json_data is None:
+            response.json.side_effect = ValueError
+        else:
+            response.json.return_value = json_data
+        return response
+
+    def profile_html(
+        self,
+        *,
+        public_username="Test_User",
+        canonical_username="Test_User",
+        avatar_id="123",
+        include_marker=True,
+    ):
+        avatar = f"https://m3.gab.com/accounts/avatars/000/000/{avatar_id}/original/avatar.png"
+        profile_name = f"Test Name (@{public_username})"
+        schema = {
+            "@context": "https://schema.org",
+            "@type": "ProfilePage",
+            "url": f"https://gab.com/{public_username}",
+            "name": profile_name,
+            "mainEntity": {
+                "@type": "Person",
+                "name": "Test Name",
+                "alternateName": f"@{public_username}",
+                "identifier": public_username,
+                "url": f"https://gab.com/{public_username}",
+                "image": avatar,
+            },
+        }
+        marker = '<div class="seo-ssr-content" role="main"><h1>{}</h1></div>'.format(profile_name) if include_marker else f"<h1>{profile_name}</h1>"
+        return f'''
+            <html><head><title>{profile_name} · Gab.com - Gab Social</title>
+            <link rel="canonical" href="https://gab.com/{canonical_username}">
+            <meta property="og:url" content="https://gab.com/{canonical_username}">
+            <meta property="og:title" content="{profile_name} · Gab.com">
+            <meta property="og:type" content="profile">
+            <meta property="og:image" content="{avatar}">
+            <meta property="profile:username" content="{public_username}@gab.com">
+            <script type="application/ld+json">{json.dumps(schema)}</script></head>
+            <body>{marker}</body></html>
+        '''
+
+    def api_data(
+        self,
+        *,
+        public_username="Test_User",
+        account_id="123",
+        avatar_id="123",
+    ):
+        return {
+            "id": account_id,
+            "username": public_username,
+            "acct": public_username,
+            "display_name": "Test Name",
+            "url": f"https://gab.com/{public_username}",
+            "avatar": f"https://m3.gab.com/accounts/avatars/000/000/{avatar_id}/original/avatar.png",
+        }
+
+    def check(self, web_response, api_response=None):
+        responses = [web_response]
+        if api_response is not None:
+            responses.append(api_response)
+        with (
+            patch("main.username.requests.request", side_effect=responses),
+            patch("main.username.time.sleep"),
+        ):
+            return check_username_on_site(
+                self.username,
+                self.site_name,
+                self.site_config,
+            )
+
+    def test_gab_certain_found(self):
+        web = self.response(200, self.profile_html())
+        api = self.response(200, json_data=self.api_data())
+        self.assertEqual(self.check(web, api)[1], FOUND)
+
+    def test_gab_confirmed_404_is_not_found(self):
+        web = self.response(404, "")
+        api = self.response(404, json_data={"error": "Record not found"})
+        self.assertEqual(self.check(web, api)[1], NOT_FOUND)
+
+    def test_gab_username_conflict_is_unknown(self):
+        web = self.response(200, self.profile_html())
+        api = self.response(200, json_data=self.api_data(public_username="Other_User"))
+        self.assertEqual(self.check(web, api)[1], UNKNOWN)
+
+    def test_gab_url_conflict_is_unknown(self):
+        web = self.response(200, self.profile_html(canonical_username="Other_User"))
+        api = self.response(200, json_data=self.api_data())
+        self.assertEqual(self.check(web, api)[1], UNKNOWN)
+
+    def test_gab_stable_id_conflict_is_unknown(self):
+        web = self.response(200, self.profile_html())
+        api = self.response(200, json_data=self.api_data(account_id="999"))
+        self.assertEqual(self.check(web, api)[1], UNKNOWN)
+
+    def test_gab_incomplete_data_is_possible(self):
+        web = self.response(200, self.profile_html(include_marker=False))
+        api = self.response(200, json_data=self.api_data())
+        self.assertEqual(self.check(web, api)[1], POSSIBLE)
+
+    def test_gab_unconfirmed_redirect_is_unknown(self):
+        web = self.response(200, self.profile_html(), "https://gab.com/Other_User")
+        api = self.response(200, json_data=self.api_data())
+        self.assertEqual(self.check(web, api)[1], UNKNOWN)
+
+    def test_gab_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_gab_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+    def test_gab_public_api_429_is_rate_limited(self):
+        web = self.response(200, self.profile_html())
+        api = self.response(429)
+        self.assertEqual(self.check(web, api)[1], RATE_LIMIT)
+
+    def test_gab_5xx_is_error(self):
+        self.assertEqual(self.check(self.response(503))[1], ERROR)
+
+    def test_gab_public_api_network_failure_is_error(self):
+        web = self.response(200, self.profile_html())
+        with (
+            patch(
+                "main.username.requests.request",
+                side_effect=[
+                    web,
+                    requests.ConnectionError("network unavailable"),
+                ],
+            ),
+            patch("main.username.time.sleep"),
+        ):
+            result = check_username_on_site(
+                self.username,
+                self.site_name,
+                self.site_config,
+            )
+        self.assertEqual(result[1], ERROR)
+
+
+class SeventhPublicProfileNetworkErrorTests(unittest.TestCase):
+    def test_network_errors_are_error_for_all_three_checkers(self):
+        configs = {
+            "Myspace": ("https://myspace.com/{username}", "myspace_profile"),
+            "HubPages": ("https://hubpages.com/@{username}", "hubpages_profile"),
+            "Gab": ("https://gab.com/{username}", "gab_profile"),
+        }
+
+        for service_name, (url, checker) in configs.items():
+            with self.subTest(service=service_name), patch(
+                "main.username.requests.request",
+                side_effect=requests.ConnectionError("network unavailable"),
+            ), patch("main.username.time.sleep"):
+                result = check_username_on_site(
+                    "Test_User",
+                    service_name,
+                    {
+                        "url": url,
+                        "checker": checker,
+                        "rate_limit_delay": 0,
+                    },
+                )
+                self.assertEqual(result[1], ERROR)
+
+
 class SixthPublicProfileNetworkErrorTests(unittest.TestCase):
     def test_network_errors_are_error_for_all_five_checkers(self):
         configs = {
@@ -5718,6 +6062,20 @@ class SixthPublicProfileCheckerConfigTests(unittest.TestCase):
             "Codementor": "codementor_profile",
             "Buzzfeed": "buzzfeed_profile",
             "Houzz": "houzz_profile",
+        }
+
+        for service_name, checker in expected.items():
+            with self.subTest(service=service_name):
+                self.assertEqual(config[service_name]["checker"], checker)
+
+
+class SeventhPublicProfileCheckerConfigTests(unittest.TestCase):
+    def test_three_services_use_dedicated_checkers(self):
+        config = load_sites_config()
+        expected = {
+            "Myspace": "myspace_profile",
+            "HubPages": "hubpages_profile",
+            "Gab": "gab_profile",
         }
 
         for service_name, checker in expected.items():

@@ -7988,6 +7988,456 @@ def classify_houzz_profile_response(username, response, profile_url):
 
 
 # ============================================================
+# SPECJALNA DETEKCJA PROFILI MYSPACE
+# ============================================================
+
+def _myspace_profile_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        ("myspace.com", "www.myspace.com"),
+        f"/{username}",
+    )
+
+
+def _myspace_profile_context(html):
+    marker_position = html.rfind("context = ")
+    if marker_position < 0:
+        return {}
+
+    object_position = html.find("{", marker_position)
+    if object_position < 0:
+        return {}
+
+    try:
+        value, _ = json.JSONDecoder().raw_decode(html[object_position:])
+    except json.JSONDecodeError:
+        return {}
+
+    return value if isinstance(value, dict) else {}
+
+
+def classify_myspace_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(response, "Myspace")
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    canonical_url = _public_profile_canonical(soup)
+    og_url = _public_profile_meta(soup, "property", "og:url")
+    og_title = _public_profile_meta(soup, "property", "og:title")
+    og_type = _public_profile_meta(soup, "property", "og:type")
+    description = _public_profile_meta(soup, "name", "description")
+    expected_username = username.casefold()
+    final_matches = _myspace_profile_url_matches(response.url, username)
+    canonical_matches = _myspace_profile_url_matches(canonical_url, username)
+    og_url_matches = _myspace_profile_url_matches(og_url, username)
+
+    context = _myspace_profile_context(response.text)
+    public_usernames = set()
+    for key in ("streamUrl", "filterStreamUrl"):
+        value = context.get(key)
+        if not isinstance(value, str):
+            continue
+        match = re.fullmatch(r"/ajax/([^/]+)/latest(?:/all|/)?", value)
+        if match:
+            public_usernames.add(unquote(match.group(1)).casefold())
+
+    context_display_id = str(context.get("displayProfileId", ""))
+    dom_display_ids = {
+        str(node.get("data-id"))
+        for node in soup.select(".connectButton[data-id]")
+        if node.get("data-id")
+    }
+    context_artist_id = str(context.get("artistId", ""))
+    dom_artist_ids = {
+        str(node.get("data-artist-id"))
+        for node in soup.select(".connectButton[data-artist-id]")
+        if node.get("data-artist-id")
+    }
+    heading = soup.find("h1")
+    heading_text = heading.get_text(" ", strip=True) if heading else ""
+    body_classes = set(soup.body.get("class", [])) if soup.body else set()
+
+    if (
+        response.status_code == 404
+        and final_matches
+        and title.casefold() == "myspace"
+        and heading_text.casefold() == "page not found"
+        and context.get("pfc") == "404"
+        and not canonical_url
+        and not og_url
+        and not context_display_id
+        and not dom_display_ids
+        and not context_artist_id
+        and not dom_artist_ids
+        and "profile" not in body_classes
+    ):
+        return NOT_FOUND, None, "public Myspace profile not found"
+
+    context_kind = str(context.get("pfc", ""))
+    conflicts = (
+        bool(response.url and not final_matches),
+        bool(canonical_url and not canonical_matches),
+        bool(og_url and not og_url_matches),
+        bool(public_usernames and public_usernames != {expected_username}),
+        bool(
+            context_display_id
+            and (
+                not context_display_id.isdigit()
+                or int(context_display_id) <= 0
+            )
+        ),
+        bool(
+            context_artist_id
+            and (
+                not context_artist_id.isdigit()
+                or int(context_artist_id) <= 0
+            )
+        ),
+        bool(
+            context_display_id
+            and dom_display_ids
+            and context_display_id not in dom_display_ids
+        ),
+        bool(
+            context_artist_id
+            and dom_artist_ids
+            and context_artist_id not in dom_artist_ids
+        ),
+        bool(context_kind and context_kind not in ("Profile", "404")),
+        bool(response.status_code == 200 and context_kind == "404"),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "Myspace profile evidence conflict"
+
+    if response.status_code >= 400:
+        return UNKNOWN, None, f"unconfirmed Myspace HTTP {response.status_code}"
+    if response.status_code != 200 or not final_matches:
+        return UNKNOWN, None, "unexpected Myspace final URL"
+
+    if (
+        canonical_matches
+        and og_url_matches
+        and og_type.casefold() == "profile"
+        and title == og_title
+        and heading_text
+        and title.casefold().startswith(heading_text.casefold())
+        and "profile" in description.casefold()
+        and public_usernames == {expected_username}
+        and context_kind == "Profile"
+        and context.get("hasProfileDetails") is True
+        and context_display_id in dom_display_ids
+        and context_artist_id in dom_artist_ids
+        and "profile" in body_classes
+        and soup.select_one(".connectButton[data-id][data-artist-id]")
+        is not None
+    ):
+        return FOUND, response.url, "public Myspace profile found; identity not verified"
+
+    return POSSIBLE, profile_url, "incomplete Myspace public profile evidence"
+
+
+# ============================================================
+# SPECJALNA DETEKCJA PROFILI HUBPAGES
+# ============================================================
+
+def _hubpages_profile_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        ("hubpages.com", "www.hubpages.com"),
+        f"/@{username}",
+    )
+
+
+def _hubpages_page_values(html):
+    match = re.search(
+        r"window\.pageKeyValues\s*=\s*(\{.*?\});",
+        html,
+        re.DOTALL,
+    )
+    if not match:
+        return {}
+    try:
+        value = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def classify_hubpages_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(response, "HubPages")
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    expected_username = username.casefold()
+    final_matches = _hubpages_profile_url_matches(response.url, username)
+    page_values = _hubpages_page_values(response.text)
+    public_path = str(page_values.get("path", ""))
+    public_username = ""
+    path_match = re.fullmatch(r"/@([^/]+)", public_path)
+    if path_match:
+        public_username = unquote(path_match.group(1)).casefold()
+
+    stable_ids = set()
+    content_item_id = str(page_values.get("contentitemid", ""))
+    content_match = re.fullmatch(r"hp-profile-(\d+)", content_item_id)
+    if content_match:
+        stable_ids.add(content_match.group(1))
+
+    tracking_match = re.search(
+        r"hp_tracking_type:\s*'([^']+)'\s*,\s*"
+        r"hp_tracking_id:\s*(\d+)",
+        response.text,
+    )
+    tracking_type = tracking_match.group(1) if tracking_match else ""
+    if tracking_match:
+        stable_ids.add(tracking_match.group(2))
+    stable_ids.update(re.findall(r"\buId:\s*(\d+)", response.text))
+
+    heading = soup.find("h1")
+    heading_text = heading.get_text(" ", strip=True) if heading else ""
+    primary = soup.select_one(".author_primary_name")
+    primary_name = primary.get_text(" ", strip=True) if primary else ""
+    body_classes = set(soup.body.get("class", [])) if soup.body else set()
+    has_profile_json = bool(page_values)
+
+    if (
+        response.status_code == 404
+        and final_matches
+        and title.casefold() == "page not found"
+        and " ".join(heading_text.casefold().split())
+        == "404. page does not exist"
+        and not has_profile_json
+        and not stable_ids
+        and "profilepage" not in body_classes
+    ):
+        return NOT_FOUND, None, "public HubPages profile not found"
+
+    conflicts = (
+        bool(response.url and not final_matches),
+        bool(public_username and public_username != expected_username),
+        bool(public_path and not path_match),
+        len(stable_ids) > 1,
+        any(not value.isdigit() or int(value) <= 0 for value in stable_ids),
+        bool(
+            response.status_code == 200
+            and title.casefold() == "page not found"
+        ),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "HubPages profile evidence conflict"
+
+    if response.status_code >= 400:
+        return UNKNOWN, None, f"unconfirmed HubPages HTTP {response.status_code}"
+    if response.status_code != 200 or not final_matches:
+        return UNKNOWN, None, "unexpected HubPages final URL"
+
+    if (
+        page_values.get("pagetype") == "profile"
+        and page_values.get("cm") == "hubpages"
+        and page_values.get("hp_site") == "hubpages"
+        and public_username == expected_username
+        and content_match is not None
+        and tracking_type == "p"
+        and len(stable_ids) == 1
+        and "profilepage" in body_classes
+        and soup.select_one(".bio_stats") is not None
+        and primary_name
+        and heading_text.startswith(primary_name)
+        and title == f"{primary_name} on HubPages"
+    ):
+        return FOUND, response.url, "public HubPages profile found; identity not verified"
+
+    return POSSIBLE, profile_url, "incomplete HubPages public profile evidence"
+
+
+# ============================================================
+# SPECJALNA DETEKCJA PROFILI GAB
+# ============================================================
+
+def _gab_profile_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        ("gab.com", "www.gab.com"),
+        f"/{username}",
+    )
+
+
+def _gab_avatar_account_id(value):
+    if not isinstance(value, str):
+        return ""
+    match = re.search(
+        r"/accounts/avatars/(\d{3})/(\d{3})/(\d{3})/",
+        value,
+    )
+    if not match:
+        return ""
+    return str(int("".join(match.groups())))
+
+
+def classify_gab_profile_response(
+    username,
+    response,
+    api_response,
+    profile_url,
+):
+    transport_result = _public_profile_transport_result(response, "Gab")
+    if transport_result:
+        return transport_result
+    api_transport_result = _public_profile_transport_result(
+        api_response,
+        "Gab public API",
+    )
+    if api_transport_result:
+        return api_transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    canonical_url = _public_profile_canonical(soup)
+    og_url = _public_profile_meta(soup, "property", "og:url")
+    og_title = _public_profile_meta(soup, "property", "og:title")
+    og_type = _public_profile_meta(soup, "property", "og:type")
+    og_image = _public_profile_meta(soup, "property", "og:image")
+    profile_username = _public_profile_meta(
+        soup,
+        "property",
+        "profile:username",
+    )
+    expected_username = username.casefold()
+    final_matches = _gab_profile_url_matches(response.url, username)
+    canonical_matches = _gab_profile_url_matches(canonical_url, username)
+    og_url_matches = _gab_profile_url_matches(og_url, username)
+
+    profile_pages = [
+        item
+        for document in _public_json_ld_documents(soup)
+        for item in _walk_public_json(document)
+        if item.get("@type") == "ProfilePage"
+    ]
+    people = [
+        item.get("mainEntity")
+        for item in profile_pages
+        if isinstance(item.get("mainEntity"), dict)
+        and item["mainEntity"].get("@type") == "Person"
+    ]
+
+    try:
+        api_data = api_response.json()
+    except (ValueError, TypeError):
+        api_data = {}
+    if not isinstance(api_data, dict):
+        api_data = {}
+
+    if (
+        response.status_code == 404
+        and api_response.status_code == 404
+        and final_matches
+        and not response.text.strip()
+        and not canonical_url
+        and not og_url
+        and not profile_pages
+        and api_data.get("error") == "Record not found"
+        and not api_data.get("id")
+    ):
+        return NOT_FOUND, None, "public Gab profile not found"
+
+    schema_usernames = {
+        str(value).removeprefix("@").casefold()
+        for person in people
+        for value in (person.get("alternateName"), person.get("identifier"))
+        if isinstance(value, str) and value
+    }
+    schema_urls = {
+        value
+        for page in profile_pages
+        for value in (page.get("url"),)
+        if isinstance(value, str) and value
+    }
+    schema_urls.update(
+        person.get("url")
+        for person in people
+        if isinstance(person.get("url"), str) and person.get("url")
+    )
+    schema_images = {
+        person.get("image")
+        for person in people
+        if isinstance(person.get("image"), str) and person.get("image")
+    }
+    api_username = str(api_data.get("username", "")).removeprefix("@").casefold()
+    api_acct = str(api_data.get("acct", "")).removeprefix("@").casefold()
+    api_id = str(api_data.get("id", ""))
+    api_url = str(api_data.get("url", ""))
+    api_image = str(api_data.get("avatar", ""))
+    avatar_ids = {
+        value
+        for image_url in (*schema_images, og_image, api_image)
+        for value in (_gab_avatar_account_id(image_url),)
+        if value
+    }
+
+    conflicts = (
+        bool(response.url and not final_matches),
+        bool(canonical_url and not canonical_matches),
+        bool(og_url and not og_url_matches),
+        bool(schema_usernames and schema_usernames != {expected_username}),
+        any(not _gab_profile_url_matches(value, username) for value in schema_urls),
+        bool(api_username and api_username != expected_username),
+        bool(api_acct and api_acct != expected_username),
+        bool(api_url and not _gab_profile_url_matches(api_url, username)),
+        bool(profile_username and profile_username.casefold() != f"{expected_username}@gab.com"),
+        bool(api_id and (not api_id.isdigit() or int(api_id) <= 0)),
+        bool(avatar_ids and avatar_ids != {api_id}),
+        bool(schema_images and api_image and schema_images != {api_image}),
+        bool(og_image and api_image and og_image != api_image),
+        bool(response.status_code == 200 and api_response.status_code == 404),
+        bool(response.status_code == 404 and api_response.status_code == 200),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "Gab profile evidence conflict"
+
+    if response.status_code >= 400 or api_response.status_code >= 400:
+        return UNKNOWN, None, "unconfirmed Gab profile response"
+    if (
+        response.status_code != 200
+        or api_response.status_code != 200
+        or not final_matches
+    ):
+        return UNKNOWN, None, "unexpected Gab profile response"
+
+    heading = soup.find("h1")
+    heading_text = heading.get_text(" ", strip=True) if heading else ""
+    profile_name = str(profile_pages[0].get("name", "")) if len(profile_pages) == 1 else ""
+    person_name = str(people[0].get("name", "")) if len(people) == 1 else ""
+    if (
+        canonical_matches
+        and og_url_matches
+        and og_type.casefold() == "profile"
+        and len(profile_pages) == 1
+        and len(people) == 1
+        and schema_usernames == {expected_username}
+        and schema_urls
+        and all(_gab_profile_url_matches(value, username) for value in schema_urls)
+        and api_username == api_acct == expected_username
+        and api_id.isdigit()
+        and _gab_profile_url_matches(api_url, username)
+        and profile_username.casefold() == f"{expected_username}@gab.com"
+        and schema_images == {api_image}
+        and og_image == api_image
+        and person_name == str(api_data.get("display_name", ""))
+        and heading_text == profile_name
+        and og_title == f"{profile_name} · Gab.com"
+        and title == f"{og_title} - Gab Social"
+        and soup.select_one(".seo-ssr-content[role='main']") is not None
+    ):
+        return FOUND, response.url, "public Gab profile found; identity not verified"
+
+    return POSSIBLE, profile_url, "incomplete Gab public profile evidence"
+
+
+# ============================================================
 # SPRAWDZANIE JEDNEGO SERWISU
 # ============================================================
 
@@ -8521,6 +8971,53 @@ def check_username_on_site(username, site_name, site_config):
             status, link, info = classify_houzz_profile_response(
                 username,
                 response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "myspace_profile":
+            status, link, info = classify_myspace_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "hubpages_profile":
+            status, link, info = classify_hubpages_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "gab_profile":
+            web_transport_result = _public_profile_transport_result(
+                response,
+                "Gab",
+            )
+            if web_transport_result:
+                status, link, info = web_transport_result
+                return site_name, status, link, info
+
+            api_url = (
+                "https://gab.com/api/v1/account_by_username/"
+                f"{quote(username, safe='')}"
+            )
+            api_response = requests.request(
+                method="GET",
+                url=api_url,
+                headers=headers,
+                timeout=timeout,
+                allow_redirects=True,
+            )
+            status, link, info = classify_gab_profile_response(
+                username,
+                response,
+                api_response,
                 url,
             )
 

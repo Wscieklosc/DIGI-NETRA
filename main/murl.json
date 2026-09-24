@@ -1027,6 +1027,7 @@
 
   "Myspace": {
     "url": "https://myspace.com/{username}",
+    "checker": "myspace_profile",
     "detect_based_on_message": true,
     "not_found_status_codes": [404],
     "not_found_message": "Page Not Found",
@@ -1035,7 +1036,7 @@
     "headers": {
       "User-Agent": "Mozilla/5.0"
     },
-    "timeout_seconds": 5,
+    "timeout_seconds": 20,
     "rate_limit_delay": 2,
     "needs_login": false,
     "custom_error_handling": true,
@@ -1704,6 +1705,7 @@
   },
   "HubPages": {
     "url": "https://hubpages.com/@{username}",
+    "checker": "hubpages_profile",
     "detect_based_on_message": true,
     "not_found_status_codes": [404],
     "not_found_message": "Page Not Found",
@@ -1977,6 +1979,7 @@
   },
   "Gab": {
     "url": "https://gab.com/{username}",
+    "checker": "gab_profile",
     "detect_based_on_message": true,
     "not_found_status_codes": [404],
     "not_found_message": "Page Not Found",
