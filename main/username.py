@@ -6138,6 +6138,678 @@ def classify_themeforest_profile_response(username, response, profile_url):
 
 
 # ============================================================
+# PUBLICZNE DANE NEXT.JS / REACT SERVER COMPONENTS
+# ============================================================
+
+def _next_f_payload_text(soup):
+    payloads = []
+    prefix = "self.__next_f.push("
+
+    for node in soup.find_all("script"):
+        script = node.string or node.get_text()
+        if not script.startswith(prefix) or not script.endswith(")"):
+            continue
+
+        try:
+            value = json.loads(script[len(prefix):-1])
+        except json.JSONDecodeError:
+            continue
+
+        if (
+            isinstance(value, list)
+            and len(value) > 1
+            and isinstance(value[1], str)
+        ):
+            payloads.append(value[1])
+
+    return "\n".join(payloads)
+
+
+def _json_object_after_marker(text, marker, start=0):
+    marker_position = text.find(marker, start)
+    if marker_position < 0:
+        return {}
+
+    object_position = text.find("{", marker_position + len(marker))
+    if object_position < 0:
+        return {}
+
+    try:
+        value, _ = json.JSONDecoder().raw_decode(text[object_position:])
+    except json.JSONDecodeError:
+        return {}
+
+    return value if isinstance(value, dict) else {}
+
+
+# ============================================================
+# SPECJALNA DETEKCJA PROFILI ISSUU
+# ============================================================
+
+def _issuu_profile_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        ("issuu.com", "www.issuu.com"),
+        f"/{username}",
+    )
+
+
+def classify_issuu_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(response, "Issuu")
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    canonical_url = _public_profile_canonical(soup)
+    og_url = _public_profile_meta(soup, "property", "og:url")
+    og_type = _public_profile_meta(soup, "property", "og:type")
+    expected_username = username.casefold()
+    final_matches = _issuu_profile_url_matches(response.url, username)
+    canonical_matches = _issuu_profile_url_matches(canonical_url, username)
+    og_url_matches = _issuu_profile_url_matches(og_url, username)
+
+    payload = _next_f_payload_text(soup)
+    publisher = _json_object_after_marker(payload, '"publisher":')
+    public_username = str(publisher.get("username", "")).casefold()
+    display_name = str(publisher.get("displayName", ""))
+    publisher_kind = str(publisher.get("kind", "")).casefold()
+    publisher_ids = {
+        str(publisher.get(key))
+        for key in ("id", "publisherId", "publicId")
+        if publisher.get(key) not in (None, "")
+    }
+    documents = publisher.get("docs", [])
+    if not isinstance(documents, list):
+        documents = []
+    owner_urls = {
+        str(item.get("ownerUrl"))
+        for item in documents
+        if isinstance(item, dict) and item.get("ownerUrl")
+    }
+
+    heading = soup.find(
+        "h1",
+        class_=lambda value: value and "ProductHeading" in str(value),
+    )
+    heading_text = heading.get_text(" ", strip=True) if heading else ""
+    title_matches = (
+        title.casefold()
+        == f"{username} publisher publications - issuu".casefold()
+    )
+
+    profile_evidence = any((canonical_url, og_url, publisher, heading))
+    structural_404 = "NEXT_HTTP_ERROR_FALLBACK;404" in payload
+    if (
+        response.status_code == 404
+        and final_matches
+        and title.casefold() == "issuu"
+        and structural_404
+        and not profile_evidence
+    ):
+        return NOT_FOUND, None, "public Issuu publisher profile not found"
+
+    conflicts = (
+        bool(response.url and not final_matches),
+        bool(canonical_url and not canonical_matches),
+        bool(og_url and not og_url_matches),
+        bool(public_username and public_username != expected_username),
+        len(publisher_ids) > 1,
+        any(not re.fullmatch(r"[A-Za-z0-9_-]+", value) for value in publisher_ids),
+        any(
+            not _issuu_profile_url_matches(
+                urljoin("https://issuu.com", value),
+                username,
+            )
+            for value in owner_urls
+        ),
+        bool(heading_text and display_name and heading_text != display_name),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "Issuu publisher profile evidence conflict"
+
+    if response.status_code >= 400:
+        return UNKNOWN, None, f"unconfirmed Issuu HTTP {response.status_code}"
+    if response.status_code != 200 or not final_matches:
+        return UNKNOWN, None, "unexpected Issuu final URL"
+
+    if (
+        (not canonical_url or canonical_matches)
+        and og_url_matches
+        and og_type.casefold() == "website"
+        and title_matches
+        and public_username == expected_username
+        and publisher_kind == "user"
+        and bool(display_name)
+        and heading_text == display_name
+        and heading is not None
+    ):
+        return (
+            FOUND,
+            profile_url,
+            "public Issuu publisher profile found; identity not verified",
+        )
+
+    return POSSIBLE, profile_url, "incomplete Issuu publisher profile evidence"
+
+
+# ============================================================
+# SPECJALNA DETEKCJA PROFILI SLIDESHARE
+# ============================================================
+
+def _slideshare_profile_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        ("slideshare.net", "www.slideshare.net"),
+        f"/{username}",
+    )
+
+
+def classify_slideshare_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(response, "Slideshare")
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    expected_username = username.casefold()
+    final_matches = _slideshare_profile_url_matches(response.url, username)
+    next_data = _json_script_by_id(soup, "__NEXT_DATA__")
+    page_props = next_data.get("props", {}).get("pageProps", {})
+    if not isinstance(page_props, dict):
+        page_props = {}
+    public_user = page_props.get("user", {})
+    if not isinstance(public_user, dict):
+        public_user = {}
+    query = next_data.get("query", {})
+    if not isinstance(query, dict):
+        query = {}
+
+    public_username = str(public_user.get("login", "")).casefold()
+    stable_ids = {
+        str(public_user.get("id"))
+        for _ in (0,)
+        if public_user.get("id") not in (None, "")
+    }
+    results = page_props.get("results", {})
+    result_items = (
+        results.get("initialResults", [])
+        if isinstance(results, dict)
+        else []
+    )
+    for item in result_items:
+        item_user = item.get("user", {}) if isinstance(item, dict) else {}
+        if isinstance(item_user, dict) and item_user.get("id") not in (None, ""):
+            stable_ids.add(str(item_user["id"]))
+
+    people = [
+        item
+        for document in _public_json_ld_documents(soup)
+        for item in _walk_public_json(document)
+        if item.get("@type") == "Person"
+    ]
+    schema_names = {
+        " ".join(str(item.get("name", "")).split()).casefold()
+        for item in people
+        if item.get("name")
+    }
+    heading = soup.select_one("h1.user-name")
+    heading_text = heading.get_text(" ", strip=True) if heading else ""
+    public_display_name = " ".join(str(public_user.get("name", "")).split())
+    metadata = page_props.get("metadata", {})
+    metadata_title = (
+        str(metadata.get("title", ""))
+        if isinstance(metadata, dict)
+        else ""
+    )
+
+    structural_soft_404 = bool(
+        title.casefold() == "page no longer exists"
+        and soup.select_one("main.ErrorPage-module__g6r4pG__root")
+        and soup.find("h1", string=lambda value: value and value.strip().casefold() == "page no longer exists")
+        and page_props.get("blankProfile") is True
+        and not public_user
+        and query.get("username", "").casefold() == expected_username
+    )
+    if structural_soft_404 and not stable_ids and not people and heading is None:
+        return NOT_FOUND, None, "public Slideshare profile not found"
+
+    conflicts = (
+        bool(response.url and not final_matches),
+        bool(query.get("username") and query.get("username", "").casefold() != expected_username),
+        bool(public_username and public_username != expected_username),
+        len(stable_ids) > 1,
+        any(not value.isdigit() for value in stable_ids),
+        bool(
+            schema_names
+            and public_display_name
+            and schema_names != {public_display_name.casefold()}
+        ),
+        bool(
+            heading_text
+            and public_display_name
+            and heading_text != public_display_name
+        ),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "Slideshare profile evidence conflict"
+
+    if response.status_code >= 400:
+        return UNKNOWN, None, f"unconfirmed Slideshare HTTP {response.status_code}"
+    if response.status_code != 200 or not final_matches:
+        return UNKNOWN, None, "unexpected Slideshare final URL"
+
+    if (
+        next_data.get("page") == "/[username]"
+        and page_props.get("name") == "profilePage"
+        and public_username == expected_username
+        and len(stable_ids) == 1
+        and metadata_title
+        and title.casefold() == metadata_title.casefold()
+        and len(people) == 1
+        and schema_names == {public_display_name.casefold()}
+        and heading_text == public_display_name
+        and heading is not None
+    ):
+        return (
+            FOUND,
+            profile_url,
+            "public Slideshare profile found; identity not verified",
+        )
+
+    return POSSIBLE, profile_url, "incomplete Slideshare public profile evidence"
+
+
+# ============================================================
+# SPECJALNA DETEKCJA PROFILI HASHNODE
+# ============================================================
+
+def _hashnode_profile_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        ("hashnode.com", "www.hashnode.com"),
+        f"/@{username}",
+    )
+
+
+def classify_hashnode_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(response, "Hashnode")
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    canonical_url = _public_profile_canonical(soup)
+    og_url = _public_profile_meta(soup, "property", "og:url")
+    og_title = _public_profile_meta(soup, "property", "og:title")
+    expected_username = username.casefold()
+    final_matches = _hashnode_profile_url_matches(response.url, username)
+    canonical_matches = _hashnode_profile_url_matches(canonical_url, username)
+    og_url_matches = _hashnode_profile_url_matches(og_url, username)
+
+    profile_pages = [
+        item
+        for document in _public_json_ld_documents(soup)
+        for item in _walk_public_json(document)
+        if item.get("@type") == "ProfilePage"
+    ]
+    people = [
+        item.get("mainEntity")
+        for item in profile_pages
+        if isinstance(item.get("mainEntity"), dict)
+        and item["mainEntity"].get("@type") == "Person"
+    ]
+    public_usernames = {
+        str(item.get("alternateName", "")).casefold()
+        for item in people
+        if item.get("alternateName")
+    }
+    public_urls = {
+        str(value)
+        for item in people
+        for value in (
+            item.get("url"),
+            *(item.get("sameAs", []) if isinstance(item.get("sameAs"), list) else []),
+        )
+        if isinstance(value, str) and "hashnode.com/@" in value
+    }
+    payload = _next_f_payload_text(soup)
+    stable_ids = set(re.findall(r'"userId":"([0-9a-f]+)"', payload, re.IGNORECASE))
+    heading = soup.find(
+        "h1",
+        class_=lambda value: value and "text-3xl" in str(value),
+    )
+    heading_text = heading.get_text(" ", strip=True) if heading else ""
+
+    structural_soft_404 = bool(
+        response.status_code == 200
+        and final_matches
+        and title.casefold() == "user not found | hashnode"
+        and og_title.casefold() == "user not found | hashnode"
+        and not canonical_url
+        and not og_url
+        and "NEXT_HTTP_ERROR_FALLBACK;404" in payload
+        and not profile_pages
+        and not people
+        and not stable_ids
+        and heading is None
+    )
+    if structural_soft_404:
+        return NOT_FOUND, None, "public Hashnode profile not found"
+
+    conflicts = (
+        bool(response.url and not final_matches),
+        bool(canonical_url and not canonical_matches),
+        bool(og_url and not og_url_matches),
+        bool(public_usernames and public_usernames != {expected_username}),
+        any(not _hashnode_profile_url_matches(value, username) for value in public_urls),
+        len(stable_ids) > 1,
+        any(not re.fullmatch(r"[0-9a-f]{24}", value, re.IGNORECASE) for value in stable_ids),
+        bool(heading_text and people and heading_text != str(people[0].get("name", ""))),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "Hashnode profile evidence conflict"
+
+    if response.status_code >= 400:
+        return UNKNOWN, None, f"unconfirmed Hashnode HTTP {response.status_code}"
+    if response.status_code != 200 or not final_matches:
+        return UNKNOWN, None, "unexpected Hashnode final URL"
+
+    title_matches = bool(
+        re.fullmatch(
+            rf".+\(@{re.escape(username)}\)\s*\|\s*Hashnode",
+            title,
+            re.IGNORECASE,
+        )
+    )
+    if (
+        canonical_matches
+        and og_url_matches
+        and title_matches
+        and len(profile_pages) == 1
+        and len(people) == 1
+        and public_usernames == {expected_username}
+        and bool(public_urls)
+        and len(stable_ids) == 1
+        and heading is not None
+        and heading_text == str(people[0].get("name", ""))
+    ):
+        return (
+            FOUND,
+            profile_url,
+            "public Hashnode profile found; identity not verified",
+        )
+
+    return POSSIBLE, profile_url, "incomplete Hashnode public profile evidence"
+
+
+# ============================================================
+# SPECJALNA DETEKCJA PROFILI CODEWARS
+# ============================================================
+
+def _codewars_profile_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        ("codewars.com", "www.codewars.com"),
+        f"/users/{username}",
+    )
+
+
+def _codewars_public_config(soup):
+    decoder = json.JSONDecoder()
+    for node in soup.find_all("script"):
+        text = node.string or node.get_text()
+        for marker in ("data: JSON.parse(", "config: JSON.parse("):
+            start = text.find(marker)
+            if start < 0:
+                continue
+            try:
+                serialized, _ = decoder.raw_decode(
+                    text[start + len(marker):].lstrip()
+                )
+                value = json.loads(serialized)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(value, dict):
+                return value
+    return {}
+
+
+def _codewars_avatar_id(value):
+    if not isinstance(value, str):
+        return None
+    match = re.search(r"/avatars/([0-9a-f]{24})(?:[/?]|$)", value, re.IGNORECASE)
+    return match.group(1).casefold() if match else None
+
+
+def classify_codewars_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(response, "Codewars")
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    og_title = _public_profile_meta(soup, "property", "og:title")
+    expected_username = username.casefold()
+    final_matches = _codewars_profile_url_matches(response.url, username)
+
+    public_config = _codewars_public_config(soup)
+    profile = public_config.get("profile", {}) if isinstance(public_config, dict) else {}
+    if not isinstance(profile, dict):
+        profile = {}
+    public_username = str(profile.get("username", "")).casefold()
+    config_id = str(profile.get("id", "")).casefold()
+    marker = soup.select_one("section.user-profile")
+    action_ids = {
+        str(node.get("data-user-profile-actions-id-value", "")).casefold()
+        for node in soup.select("[data-user-profile-actions-id-value]")
+        if node.get("data-user-profile-actions-id-value")
+    }
+    avatar_ids = {
+        value
+        for node in soup.select("section.user-profile img[src]")
+        for value in (_codewars_avatar_id(node.get("src", "")),)
+        if value
+    }
+    stable_ids = {
+        value for value in (config_id, *action_ids, *avatar_ids) if value
+    }
+    profile_links = {
+        str(node.get("href"))
+        for node in soup.select("section.user-profile a[href]")
+        if node.get("href")
+        and unquote(str(node.get("href"))).rstrip("/").casefold()
+        == f"/users/{username}".casefold()
+    }
+
+    not_found_main = soup.select_one("main#shell_content")
+    not_found_text = (
+        not_found_main.get_text(" ", strip=True).casefold()
+        if not_found_main
+        else ""
+    )
+    if (
+        response.status_code == 404
+        and final_matches
+        and title.casefold() == "codewars | achieve mastery through challenge"
+        and "404" in not_found_text
+        and "page you were looking for doesn't seem to exist" in not_found_text
+        and not profile
+        and marker is None
+        and not stable_ids
+    ):
+        return NOT_FOUND, None, "public Codewars profile not found"
+
+    conflicts = (
+        bool(response.url and not final_matches),
+        bool(public_username and public_username != expected_username),
+        len(stable_ids) > 1,
+        any(not re.fullmatch(r"[0-9a-f]{24}", value, re.IGNORECASE) for value in stable_ids),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "Codewars profile evidence conflict"
+
+    if response.status_code >= 400:
+        return UNKNOWN, None, f"unconfirmed Codewars HTTP {response.status_code}"
+    if response.status_code != 200 or not final_matches:
+        return UNKNOWN, None, "unexpected Codewars final URL"
+
+    if (
+        title.casefold() == f"{username} | codewars".casefold()
+        and og_title.casefold() == expected_username
+        and public_username == expected_username
+        and len(stable_ids) == 1
+        and marker is not None
+        and bool(profile_links)
+    ):
+        return (
+            FOUND,
+            profile_url,
+            "public Codewars profile found; identity not verified",
+        )
+
+    return POSSIBLE, profile_url, "incomplete Codewars public profile evidence"
+
+
+# ============================================================
+# SPECJALNA DETEKCJA PROFILI AUDIOMACK
+# ============================================================
+
+def _audiomack_profile_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        ("audiomack.com", "www.audiomack.com"),
+        f"/{username}",
+    )
+
+
+def classify_audiomack_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(response, "Audiomack")
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    canonical_url = _public_profile_canonical(soup)
+    og_url = _public_profile_meta(soup, "property", "og:url")
+    og_type = _public_profile_meta(soup, "property", "og:type")
+    profile_username = _public_profile_meta(
+        soup,
+        "property",
+        "profile:username",
+    ).casefold()
+    expected_username = username.casefold()
+    final_matches = _audiomack_profile_url_matches(response.url, username)
+    canonical_matches = _audiomack_profile_url_matches(canonical_url, username)
+    og_url_matches = _audiomack_profile_url_matches(og_url, username)
+
+    music_groups = [
+        item
+        for document in _public_json_ld_documents(soup)
+        for item in _walk_public_json(document)
+        if item.get("@type") == "MusicGroup"
+    ]
+    schema_urls = {
+        str(value)
+        for item in music_groups
+        for value in (
+            item.get("url"),
+            *(item.get("sameAs", []) if isinstance(item.get("sameAs"), list) else []),
+        )
+        if isinstance(value, str) and "audiomack.com/" in value
+    }
+    schema_ids = {
+        str(item.get("identifier"))
+        for item in music_groups
+        if item.get("identifier") not in (None, "")
+    }
+    payload = _next_f_payload_text(soup)
+    artist_page_position = payload.find('"ArtistPage-content"')
+    artist = _json_object_after_marker(
+        payload,
+        '"artist":',
+        max(artist_page_position, 0),
+    ) if artist_page_position >= 0 else {}
+    artist_username = str(artist.get("url_slug", "")).casefold()
+    artist_id = str(artist.get("id", ""))
+    stable_ids = {value for value in (artist_id, *schema_ids) if value}
+    marker = soup.select_one("h1.ArtistInfo-name")
+    marker_name = marker.get_text(" ", strip=True) if marker else ""
+
+    not_found_marker = soup.select_one("section.NotFoundPage h1.NotFoundPage-title")
+    generic_soft_404 = bool(
+        response.status_code == 200
+        and final_matches
+        and not_found_marker
+        and not_found_marker.get_text(" ", strip=True).casefold() == "page not found"
+        and not canonical_url
+        and og_url.rstrip("/").casefold() == "https://audiomack.com"
+        and og_type.casefold() == "website"
+        and not artist
+        and not music_groups
+        and not profile_username
+    )
+    if generic_soft_404:
+        return (
+            UNKNOWN,
+            None,
+            "Audiomack public profile not confirmed; account existence unknown",
+        )
+
+    conflicts = (
+        bool(response.url and not final_matches),
+        bool(canonical_url and not canonical_matches),
+        bool(og_url and not og_url_matches),
+        bool(profile_username and profile_username != expected_username),
+        bool(artist_username and artist_username != expected_username),
+        any(not _audiomack_profile_url_matches(value, username) for value in schema_urls),
+        len(stable_ids) > 1,
+        any(not value.isdigit() for value in stable_ids),
+        bool(marker_name and artist.get("name") and marker_name != artist.get("name")),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "Audiomack profile evidence conflict"
+
+    if response.status_code >= 400:
+        return UNKNOWN, None, f"unconfirmed Audiomack HTTP {response.status_code}"
+    if response.status_code != 200 or not final_matches:
+        return UNKNOWN, None, "unexpected Audiomack final URL"
+
+    if (
+        canonical_matches
+        and og_url_matches
+        and og_type.casefold() == "profile"
+        and profile_username == expected_username
+        and title.casefold().endswith(" - listen free on audiomack")
+        and len(music_groups) == 1
+        and bool(schema_urls)
+        and artist_username == expected_username
+        and artist.get("type") == "artist"
+        and artist.get("status") == "active"
+        and len(stable_ids) == 1
+        and marker is not None
+        and marker_name == artist.get("name")
+    ):
+        return (
+            FOUND,
+            profile_url,
+            "public Audiomack profile found; identity not verified",
+        )
+
+    profile_evidence = any((
+        canonical_url,
+        profile_username,
+        music_groups,
+        artist,
+        marker,
+    ))
+    if profile_evidence:
+        return POSSIBLE, profile_url, "incomplete Audiomack public profile evidence"
+
+    return UNKNOWN, None, "Audiomack public profile not confirmed"
+
+
+# ============================================================
 # SPRAWDZANIE JEDNEGO SERWISU
 # ============================================================
 
@@ -6522,6 +7194,51 @@ def check_username_on_site(username, site_name, site_config):
 
         if checker == "themeforest_profile":
             status, link, info = classify_themeforest_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "issuu_profile":
+            status, link, info = classify_issuu_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "slideshare_profile":
+            status, link, info = classify_slideshare_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "hashnode_profile":
+            status, link, info = classify_hashnode_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "codewars_profile":
+            status, link, info = classify_codewars_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "audiomack_profile":
+            status, link, info = classify_audiomack_profile_response(
                 username,
                 response,
                 url,

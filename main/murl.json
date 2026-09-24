@@ -811,6 +811,7 @@
   },
   "Issuu": {
     "url": "https://issuu.com/{username}",
+    "checker": "issuu_profile",
     "detect_based_on_message": true,
     "not_found_status_codes": [404],
     "not_found_message": "Page Not Found",
@@ -828,6 +829,7 @@
   },
   "Slideshare": {
     "url": "https://www.slideshare.net/{username}",
+    "checker": "slideshare_profile",
     "detect_based_on_message": true,
     "not_found_status_codes": [404],
     "not_found_message": "Page Not Found",
@@ -1159,6 +1161,7 @@
   },
   "Hashnode": {
     "url": "https://hashnode.com/@{username}",
+    "checker": "hashnode_profile",
     "detect_based_on_message": true,
     "not_found_status_codes": [404],
     "not_found_message": "Page Not Found",
@@ -1211,6 +1214,7 @@
   },
   "Codewars": {
     "url": "https://www.codewars.com/users/{username}",
+    "checker": "codewars_profile",
     "detect_based_on_message": true,
     "not_found_status_codes": [404],
     "not_found_message": "Page Not Found",
@@ -1997,6 +2001,7 @@
   },
   "Audiomack": {
     "url": "https://audiomack.com/{username}",
+    "checker": "audiomack_profile",
     "detect_based_on_message": true,
     "not_found_status_codes": [404],
     "not_found_message": "Page Not Found",

@@ -4455,5 +4455,432 @@ class ThirdPublicProfileCheckerConfigTests(unittest.TestCase):
                 self.assertEqual(config[service_name]["checker"], checker)
 
 
+class IssuuProfileDetectionTests(
+    PublicProfileCheckerMixin,
+    unittest.TestCase,
+):
+    site_name = "Issuu"
+    default_url = "https://issuu.com/Test_User"
+    site_config = {
+        "url": "https://issuu.com/{username}",
+        "checker": "issuu_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def profile_html(
+        self,
+        *,
+        public_username="Test_User",
+        ids=None,
+        include_publisher=True,
+    ):
+        publisher = {
+            "displayName": "Test Publisher",
+            "username": public_username,
+            "kind": "user",
+        }
+        publisher.update(ids or {})
+        payload = (
+            f'7:["$",null,null,{{"publisher":{json.dumps(publisher)}}}]'
+            if include_publisher else "7:null"
+        )
+        flight = json.dumps([1, payload])
+        return f"""
+            <html><head>
+                <title>{public_username} Publisher Publications - Issuu</title>
+                <link rel="canonical" href="https://issuu.com/{public_username}">
+                <meta property="og:url" content="https://issuu.com/{public_username}">
+                <meta property="og:type" content="website">
+            </head><body>
+                <h1 class="ProductHeading__product-heading">Test Publisher</h1>
+                <script>self.__next_f.push({flight})</script>
+            </body></html>
+        """
+
+    def test_issuu_certain_found(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html()))[1], FOUND)
+
+    def test_issuu_confirmed_404_is_not_found(self):
+        flight = json.dumps([1, '7:E{"digest":"NEXT_HTTP_ERROR_FALLBACK;404"}'])
+        html = f'<html><head><title>Issuu</title></head><body><script>self.__next_f.push({flight})</script></body></html>'
+        self.assertEqual(self.check(self.response(404, html))[1], NOT_FOUND)
+
+    def test_issuu_username_conflict_is_unknown(self):
+        html = self.profile_html(public_username="Other_User")
+        self.assertEqual(self.check(self.response(200, html))[1], UNKNOWN)
+
+    def test_issuu_url_conflict_is_unknown(self):
+        response = self.response(200, self.profile_html(), url="https://issuu.com/Other_User")
+        self.assertEqual(self.check(response)[1], UNKNOWN)
+
+    def test_issuu_stable_id_conflict_is_unknown(self):
+        html = self.profile_html(ids={"id": "123", "publisherId": "987"})
+        self.assertEqual(self.check(self.response(200, html))[1], UNKNOWN)
+
+    def test_issuu_incomplete_data_is_possible(self):
+        html = self.profile_html(include_publisher=False)
+        self.assertEqual(self.check(self.response(200, html))[1], POSSIBLE)
+
+    def test_issuu_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_issuu_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+
+class SlideshareProfileDetectionTests(
+    PublicProfileCheckerMixin,
+    unittest.TestCase,
+):
+    site_name = "Slideshare"
+    default_url = "https://www.slideshare.net/Test_User"
+    site_config = {
+        "url": "https://www.slideshare.net/{username}",
+        "checker": "slideshare_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def profile_html(
+        self,
+        *,
+        public_username="Test_User",
+        user_id="12345",
+        result_id="12345",
+        include_schema=True,
+    ):
+        user = {
+            "id": user_id,
+            "name": "Test Publisher",
+            "login": public_username,
+        }
+        data = {
+            "props": {"pageProps": {
+                "metadata": {"title": "Test Publisher"},
+                "name": "profilePage",
+                "user": user,
+                "results": {"initialResults": [{
+                    "user": {
+                        "id": result_id,
+                        "name": "Test Publisher",
+                        "login": public_username,
+                    },
+                }]},
+            }},
+            "page": "/[username]",
+            "query": {"username": "Test_User"},
+        }
+        schema = ""
+        if include_schema:
+            schema = '<script type="application/ld+json">{"@type":"Person","name":"Test Publisher"}</script>'
+        return f"""
+            <html><head><title>Test Publisher</title>{schema}
+            <script id="__NEXT_DATA__" type="application/json">{json.dumps(data)}</script>
+            </head><body><h1 class="user-name">Test Publisher</h1></body></html>
+        """
+
+    def soft_404_html(self):
+        data = {
+            "props": {"pageProps": {
+                "name": "profilePage",
+                "user": None,
+                "blankProfile": True,
+            }},
+            "page": "/[username]",
+            "query": {"username": "Test_User"},
+        }
+        return f"""
+            <html><head><title>Page no longer exists</title>
+            <script id="__NEXT_DATA__" type="application/json">{json.dumps(data)}</script>
+            </head><body><main class="ErrorPage-module__g6r4pG__root">
+            <h1>Page no longer exists</h1></main></body></html>
+        """
+
+    def test_slideshare_certain_found(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html()))[1], FOUND)
+
+    def test_slideshare_structural_soft_404_is_not_found(self):
+        self.assertEqual(self.check(self.response(200, self.soft_404_html()))[1], NOT_FOUND)
+
+    def test_slideshare_username_conflict_is_unknown(self):
+        html = self.profile_html(public_username="Other_User")
+        self.assertEqual(self.check(self.response(200, html))[1], UNKNOWN)
+
+    def test_slideshare_url_conflict_is_unknown(self):
+        response = self.response(200, self.profile_html(), url="https://www.slideshare.net/Other_User")
+        self.assertEqual(self.check(response)[1], UNKNOWN)
+
+    def test_slideshare_stable_id_conflict_is_unknown(self):
+        html = self.profile_html(result_id="98765")
+        self.assertEqual(self.check(self.response(200, html))[1], UNKNOWN)
+
+    def test_slideshare_incomplete_data_is_possible(self):
+        html = self.profile_html(include_schema=False)
+        self.assertEqual(self.check(self.response(200, html))[1], POSSIBLE)
+
+    def test_slideshare_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_slideshare_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+
+class HashnodeProfileDetectionTests(
+    PublicProfileCheckerMixin,
+    unittest.TestCase,
+):
+    site_name = "Hashnode"
+    default_url = "https://hashnode.com/@Test_User"
+    site_config = {
+        "url": "https://hashnode.com/@{username}",
+        "checker": "hashnode_profile",
+        "rate_limit_delay": 0,
+    }
+
+    stable_id = "54b81b232807bee71445ebba"
+
+    def profile_html(
+        self,
+        *,
+        public_username="Test_User",
+        stable_ids=None,
+    ):
+        person = {
+            "@type": "Person",
+            "name": "Test Author",
+            "alternateName": public_username,
+            "url": f"https://hashnode.com/@{public_username}",
+            "sameAs": [f"https://hashnode.com/@{public_username}"],
+        }
+        schema = {"@type": "ProfilePage", "mainEntity": person}
+        stable_ids = [self.stable_id] if stable_ids is None else stable_ids
+        payload = "\n".join(
+            f'7:[{{"userId":"{stable_id}"}}]'
+            for stable_id in stable_ids
+        )
+        flight = json.dumps([1, payload])
+        return f"""
+            <html><head>
+                <title>Test Author (@{public_username}) | Hashnode</title>
+                <link rel="canonical" href="https://hashnode.com/@{public_username}">
+                <meta property="og:url" content="https://hashnode.com/@{public_username}">
+                <script type="application/ld+json">{json.dumps(schema)}</script>
+            </head><body><h1 class="text-3xl">Test Author</h1>
+            <script>self.__next_f.push({flight})</script></body></html>
+        """
+
+    def soft_404_html(self):
+        payload = '4:E{"digest":"NEXT_HTTP_ERROR_FALLBACK;404"}'
+        flight = json.dumps([1, payload])
+        return f"""
+            <html><head><title>User not found | Hashnode</title>
+            <meta property="og:title" content="User not found | Hashnode"></head>
+            <body><script>self.__next_f.push({flight})</script></body></html>
+        """
+
+    def test_hashnode_certain_found(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html()))[1], FOUND)
+
+    def test_hashnode_structural_soft_404_is_not_found(self):
+        self.assertEqual(self.check(self.response(200, self.soft_404_html()))[1], NOT_FOUND)
+
+    def test_hashnode_username_conflict_is_unknown(self):
+        html = self.profile_html(public_username="Other_User")
+        self.assertEqual(self.check(self.response(200, html))[1], UNKNOWN)
+
+    def test_hashnode_url_conflict_is_unknown(self):
+        response = self.response(200, self.profile_html(), url="https://hashnode.com/@Other_User")
+        self.assertEqual(self.check(response)[1], UNKNOWN)
+
+    def test_hashnode_stable_id_conflict_is_unknown(self):
+        html = self.profile_html(stable_ids=[self.stable_id, "64b81b232807bee71445ebba"])
+        self.assertEqual(self.check(self.response(200, html))[1], UNKNOWN)
+
+    def test_hashnode_incomplete_data_is_possible(self):
+        html = self.profile_html(stable_ids=[])
+        self.assertEqual(self.check(self.response(200, html))[1], POSSIBLE)
+
+    def test_hashnode_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_hashnode_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+
+class CodewarsProfileDetectionTests(
+    PublicProfileCheckerMixin,
+    unittest.TestCase,
+):
+    site_name = "Codewars"
+    default_url = "https://www.codewars.com/users/Test_User"
+    site_config = {
+        "url": "https://www.codewars.com/users/{username}",
+        "checker": "codewars_profile",
+        "rate_limit_delay": 0,
+    }
+
+    stable_id = "545207bac8e60b30fc000942"
+
+    def profile_html(
+        self,
+        *,
+        public_username="Test_User",
+        config_id=None,
+        marker_id=None,
+        include_config=True,
+    ):
+        config_id = config_id or self.stable_id
+        marker_id = marker_id or self.stable_id
+        script = ""
+        if include_config:
+            config = {"profile": {"id": config_id, "username": public_username}}
+            serialized = json.dumps(json.dumps(config))
+            script = f"<script>App.setup({{config: JSON.parse({serialized})}});</script>"
+        return f"""
+            <html><head><title>{public_username} | Codewars</title>
+            <meta property="og:title" content="{public_username}">
+            <meta property="og:url" content="https://www.codewars.com">
+            </head><body><section class="user-profile">
+                <a href="/users/{public_username}"><img src="https://www.codewars.com/avatars/{config_id}"></a>
+                <div data-user-profile-actions-id-value="{marker_id}"></div>
+            </section>{script}</body></html>
+        """
+
+    def test_codewars_certain_found_ignores_generic_og_url(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html()))[1], FOUND)
+
+    def test_codewars_confirmed_404_is_not_found(self):
+        html = """
+            <html><head><title>Codewars | Achieve Mastery Through Challenge</title></head>
+            <body><main id="shell_content">404 Whoops! The page you were looking for doesn't seem to exist.</main></body></html>
+        """
+        self.assertEqual(self.check(self.response(404, html))[1], NOT_FOUND)
+
+    def test_codewars_username_conflict_is_unknown(self):
+        html = self.profile_html(public_username="Other_User")
+        self.assertEqual(self.check(self.response(200, html))[1], UNKNOWN)
+
+    def test_codewars_url_conflict_is_unknown(self):
+        response = self.response(200, self.profile_html(), url="https://www.codewars.com/users/Other_User")
+        self.assertEqual(self.check(response)[1], UNKNOWN)
+
+    def test_codewars_stable_id_conflict_is_unknown(self):
+        html = self.profile_html(marker_id="645207bac8e60b30fc000942")
+        self.assertEqual(self.check(self.response(200, html))[1], UNKNOWN)
+
+    def test_codewars_incomplete_data_is_possible(self):
+        html = self.profile_html(include_config=False)
+        self.assertEqual(self.check(self.response(200, html))[1], POSSIBLE)
+
+    def test_codewars_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_codewars_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+
+class AudiomackProfileDetectionTests(
+    PublicProfileCheckerMixin,
+    unittest.TestCase,
+):
+    site_name = "Audiomack"
+    default_url = "https://audiomack.com/Test_User"
+    site_config = {
+        "url": "https://audiomack.com/{username}",
+        "checker": "audiomack_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def profile_html(
+        self,
+        *,
+        public_username="Test_User",
+        artist_id="12345",
+        schema_id=None,
+        include_artist=True,
+    ):
+        schema = {
+            "@type": "MusicGroup",
+            "name": "Test Artist",
+            "url": f"https://audiomack.com/{public_username}",
+            "sameAs": [f"https://audiomack.com/{public_username}"],
+        }
+        if schema_id is not None:
+            schema["identifier"] = schema_id
+        payload = '8:["$","div",null,{"className":"ArtistPage-content"}]'
+        if include_artist:
+            artist = {
+                "id": int(artist_id),
+                "url_slug": public_username,
+                "name": "Test Artist",
+                "type": "artist",
+                "status": "active",
+            }
+            payload += f'\n9:["$",null,null,{{"artist":{json.dumps(artist)}}}]'
+        flight = json.dumps([1, payload])
+        return f"""
+            <html><head><title>Test Artist - Listen Free on Audiomack</title>
+                <link rel="canonical" href="https://audiomack.com/{public_username}">
+                <meta property="og:url" content="https://audiomack.com/{public_username}">
+                <meta property="og:type" content="profile">
+                <meta property="profile:username" content="{public_username}">
+                <script type="application/ld+json">{json.dumps(schema)}</script>
+            </head><body><h1 class="ArtistInfo-name">Test Artist</h1>
+            <script>self.__next_f.push({flight})</script></body></html>
+        """
+
+    def generic_soft_404_html(self):
+        return """
+            <html><head><title>Audiomack - Music platform empowering artists &amp; fans | Audiomack</title>
+            <meta property="og:url" content="https://audiomack.com/">
+            <meta property="og:type" content="website"></head><body>
+            <section class="NotFoundPage"><h1 class="NotFoundPage-title">Page Not Found</h1></section>
+            </body></html>
+        """
+
+    def test_audiomack_certain_found(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html()))[1], FOUND)
+
+    def test_audiomack_generic_soft_404_is_unknown(self):
+        self.assertEqual(self.check(self.response(200, self.generic_soft_404_html()))[1], UNKNOWN)
+
+    def test_audiomack_username_conflict_is_unknown(self):
+        html = self.profile_html(public_username="Other_User")
+        self.assertEqual(self.check(self.response(200, html))[1], UNKNOWN)
+
+    def test_audiomack_url_conflict_is_unknown(self):
+        response = self.response(200, self.profile_html(), url="https://audiomack.com/Other_User")
+        self.assertEqual(self.check(response)[1], UNKNOWN)
+
+    def test_audiomack_stable_id_conflict_is_unknown(self):
+        html = self.profile_html(schema_id="98765")
+        self.assertEqual(self.check(self.response(200, html))[1], UNKNOWN)
+
+    def test_audiomack_incomplete_data_is_possible(self):
+        html = self.profile_html(include_artist=False)
+        self.assertEqual(self.check(self.response(200, html))[1], POSSIBLE)
+
+    def test_audiomack_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_audiomack_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+
+class FourthPublicProfileCheckerConfigTests(unittest.TestCase):
+    def test_five_services_use_dedicated_checkers(self):
+        config = load_sites_config()
+        expected = {
+            "Issuu": "issuu_profile",
+            "Slideshare": "slideshare_profile",
+            "Hashnode": "hashnode_profile",
+            "Codewars": "codewars_profile",
+            "Audiomack": "audiomack_profile",
+        }
+
+        for service_name, checker in expected.items():
+            with self.subTest(service=service_name):
+                self.assertEqual(config[service_name]["checker"], checker)
+
+
 if __name__ == "__main__":
     unittest.main()
