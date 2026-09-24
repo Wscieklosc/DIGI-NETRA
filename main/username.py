@@ -6810,6 +6810,647 @@ def classify_audiomack_profile_response(username, response, profile_url):
 
 
 # ============================================================
+# SPECJALNA DETEKCJA WORKSPACE BITBUCKET
+# ============================================================
+
+def _bitbucket_root_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        ("bitbucket.org", "www.bitbucket.org"),
+        f"/{username}",
+    )
+
+
+def _bitbucket_workspace_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        ("bitbucket.org", "www.bitbucket.org"),
+        f"/{username}/workspace/repositories",
+    )
+
+
+def _bitbucket_uuid(value):
+    if not isinstance(value, str):
+        return ""
+    normalized = value.strip().strip("{}").casefold()
+    if re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        normalized,
+    ):
+        return normalized
+    return ""
+
+
+def classify_bitbucket_profile_response(
+    username,
+    response,
+    api_response,
+    profile_url,
+):
+    transport_result = _public_profile_transport_result(response, "Bitbucket")
+    if transport_result:
+        return transport_result
+    if api_response is not None:
+        api_transport = _public_profile_transport_result(
+            api_response,
+            "Bitbucket API",
+        )
+        if api_transport:
+            return api_transport
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    expected_username = username.casefold()
+    final_workspace_matches = _bitbucket_workspace_url_matches(
+        response.url,
+        username,
+    )
+    final_root_matches = _bitbucket_root_url_matches(response.url, username)
+
+    api_data = {}
+    if api_response is not None and api_response.status_code == 200:
+        try:
+            candidate = api_response.json()
+        except (ValueError, TypeError):
+            try:
+                candidate = json.loads(api_response.text)
+            except (TypeError, json.JSONDecodeError):
+                candidate = {}
+        if isinstance(candidate, dict):
+            api_data = candidate
+
+    api_slug = str(api_data.get("slug", "")).casefold()
+    api_type = str(api_data.get("type", "")).casefold()
+    api_uuid = _bitbucket_uuid(api_data.get("uuid"))
+    links = api_data.get("links", {})
+    html_link = links.get("html", {}) if isinstance(links, dict) else {}
+    api_html_url = (
+        str(html_link.get("href", ""))
+        if isinstance(html_link, dict)
+        else ""
+    )
+    dom_uuids = {
+        value
+        for node in soup.select("meta[data-target-workspace-uuid]")
+        for value in (_bitbucket_uuid(node.get("data-target-workspace-uuid")),)
+        if value
+    }
+
+    profile_evidence = bool(api_data or dom_uuids or final_workspace_matches)
+    if (
+        response.status_code == 404
+        and api_response is not None
+        and api_response.status_code == 404
+        and final_root_matches
+        and title.casefold() == "404 — bitbucket"
+        and soup.find(
+            "h1",
+            string=lambda value: value
+            and value.strip().casefold() == "resource not found",
+        )
+        and not profile_evidence
+    ):
+        return NOT_FOUND, None, "public Bitbucket workspace not found"
+
+    conflicts = (
+        bool(
+            response.url
+            and response.status_code == 200
+            and not final_workspace_matches
+        ),
+        bool(
+            response.url
+            and response.status_code == 404
+            and not final_root_matches
+        ),
+        bool(api_slug and api_slug != expected_username),
+        bool(api_html_url and not _bitbucket_root_url_matches(api_html_url, username)),
+        len(dom_uuids) > 1,
+        bool(api_uuid and dom_uuids and dom_uuids != {api_uuid}),
+        bool(api_data and not api_uuid),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "Bitbucket workspace evidence conflict"
+
+    if response.status_code >= 400 or (
+        api_response is not None and api_response.status_code >= 400
+    ):
+        if api_response is not None and api_response.status_code == 200:
+            return POSSIBLE, profile_url, "incomplete Bitbucket workspace evidence"
+        return UNKNOWN, None, "Bitbucket workspace not confirmed"
+
+    if (
+        response.status_code == 200
+        and api_response is not None
+        and api_response.status_code == 200
+        and final_workspace_matches
+        and title.casefold() == "bitbucket"
+        and api_slug == expected_username
+        and api_type == "workspace"
+        and _bitbucket_root_url_matches(api_html_url, username)
+        and bool(api_uuid)
+        and dom_uuids == {api_uuid}
+    ):
+        return (
+            FOUND,
+            response.url,
+            "public Bitbucket workspace found; identity not verified",
+        )
+
+    return POSSIBLE, profile_url, "incomplete Bitbucket workspace evidence"
+
+
+# ============================================================
+# SPECJALNA DETEKCJA PROFILI DEVIANTART
+# ============================================================
+
+def _deviantart_profile_slug(value):
+    if not isinstance(value, str) or not value:
+        return ""
+    parsed = urlparse(value)
+    if (
+        parsed.scheme not in ("http", "https")
+        or parsed.netloc.casefold()
+        not in ("deviantart.com", "www.deviantart.com")
+    ):
+        return ""
+    path = unquote(parsed.path).strip("/")
+    return path.casefold() if path and "/" not in path else ""
+
+
+def _public_alias_values(value):
+    if isinstance(value, str):
+        return {value.casefold()}
+    if isinstance(value, list):
+        return {
+            str(item).casefold()
+            for item in value
+            if isinstance(item, str) and item
+        }
+    return set()
+
+
+def classify_deviantart_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(response, "DeviantArt")
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    canonical_url = _public_profile_canonical(soup)
+    og_url = _public_profile_meta(soup, "property", "og:url")
+    expected_username = username.casefold()
+    final_slug = _deviantart_profile_slug(response.url)
+    canonical_slug = _deviantart_profile_slug(canonical_url)
+    og_slug = _deviantart_profile_slug(og_url)
+
+    profile_pages = [
+        item
+        for document in _public_json_ld_documents(soup)
+        for item in _walk_public_json(document)
+        if item.get("@type") == "ProfilePage"
+    ]
+    people = [
+        item.get("mainEntity")
+        for item in profile_pages
+        if isinstance(item.get("mainEntity"), dict)
+        and item["mainEntity"].get("@type") == "Person"
+    ]
+    schema_slugs = {
+        _deviantart_profile_slug(value)
+        for item in profile_pages + people
+        for value in (item.get("url"), item.get("@id"))
+        if _deviantart_profile_slug(value)
+    }
+    aliases = set()
+    stable_ids = set()
+    for item in profile_pages + people:
+        aliases.update(_public_alias_values(item.get("alternateName")))
+        if item.get("identifier") not in (None, ""):
+            stable_ids.add(str(item["identifier"]))
+
+    person_name = str(people[0].get("name", "")) if len(people) == 1 else ""
+    heading = soup.find("h1")
+    heading_text = heading.get_text(" ", strip=True) if heading else ""
+    exact_profile = final_slug == expected_username
+    alias_confirmed = bool(
+        final_slug
+        and final_slug != expected_username
+        and expected_username in aliases
+    )
+
+    if (
+        response.status_code == 404
+        and final_slug == expected_username
+        and title.casefold() == "deviantart: 404"
+        and heading_text.casefold() == "llama not found"
+        and not canonical_url
+        and not profile_pages
+        and not people
+    ):
+        return NOT_FOUND, None, "public DeviantArt profile not found"
+
+    conflicts = (
+        bool(response.url and not final_slug),
+        bool(final_slug and canonical_url and canonical_slug != final_slug),
+        bool(final_slug and og_url and og_slug != final_slug),
+        bool(schema_slugs and schema_slugs != {final_slug}),
+        bool(person_name and final_slug and person_name.casefold() != final_slug),
+        bool(heading_text and person_name and heading_text != person_name),
+        len(stable_ids) > 1,
+        bool(final_slug and final_slug != expected_username and not alias_confirmed),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "DeviantArt profile evidence conflict"
+
+    if response.status_code >= 400:
+        return UNKNOWN, None, f"unconfirmed DeviantArt HTTP {response.status_code}"
+    if response.status_code != 200:
+        return UNKNOWN, None, "unexpected DeviantArt response"
+
+    if (
+        (exact_profile or alias_confirmed)
+        and canonical_slug == final_slug
+        and og_slug == final_slug
+        and len(profile_pages) == 1
+        and len(people) == 1
+        and schema_slugs == {final_slug}
+        and person_name.casefold() == final_slug
+        and heading is not None
+        and heading_text == person_name
+        and title.casefold() == f"{person_name} on deviantart".casefold()
+    ):
+        return (
+            FOUND,
+            response.url,
+            "public DeviantArt profile found; identity not verified",
+        )
+
+    return POSSIBLE, profile_url, "incomplete DeviantArt public profile evidence"
+
+
+# ============================================================
+# SPECJALNA DETEKCJA PROFILI BUY ME A COFFEE
+# ============================================================
+
+def _buymeacoffee_profile_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        ("buymeacoffee.com", "www.buymeacoffee.com"),
+        f"/{username}",
+    )
+
+
+def _buymeacoffee_page_data(soup):
+    node = soup.select_one('script[data-page="app"][type="application/json"]')
+    if node is None:
+        return {}
+    try:
+        value = json.loads(node.string or node.get_text())
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def classify_buymeacoffee_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(
+        response,
+        "Buy Me a Coffee",
+    )
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    canonical_url = _public_profile_canonical(soup)
+    og_url = _public_profile_meta(soup, "property", "og:url")
+    final_matches = _buymeacoffee_profile_url_matches(response.url, username)
+    canonical_matches = _buymeacoffee_profile_url_matches(
+        canonical_url,
+        username,
+    )
+    og_url_matches = _buymeacoffee_profile_url_matches(og_url, username)
+    expected_username = username.casefold()
+
+    page_data = _buymeacoffee_page_data(soup)
+    props = page_data.get("props", {})
+    if not isinstance(props, dict):
+        props = {}
+    creator_wrapper = props.get("creator_data", {})
+    creator = (
+        creator_wrapper.get("data", {})
+        if isinstance(creator_wrapper, dict)
+        else {}
+    )
+    if not isinstance(creator, dict):
+        creator = {}
+    public_username = str(creator.get("slug", "")).casefold()
+    public_name = str(creator.get("name", "")).strip()
+    stable_id = str(creator.get("user_id", ""))
+    heading = soup.find("h1")
+    heading_text = heading.get_text(" ", strip=True) if heading else ""
+    expected_headings = {
+        f"Buy {public_name} a coffee",
+        f"Support {public_name}",
+    }
+
+    if (
+        response.status_code == 404
+        and final_matches
+        and title.casefold() == "not found | buy me a coffee"
+        and page_data.get("component") == "Error"
+        and props.get("status") == 404
+        and not canonical_url
+        and not og_url
+        and not creator
+    ):
+        return NOT_FOUND, None, "public Buy Me a Coffee profile not found"
+
+    conflicts = (
+        bool(response.url and not final_matches),
+        bool(canonical_url and not canonical_matches),
+        bool(og_url and not og_url_matches),
+        bool(public_username and public_username != expected_username),
+        bool(stable_id and not stable_id.isdigit()),
+        bool(public_name and heading_text and heading_text not in expected_headings),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "Buy Me a Coffee profile evidence conflict"
+
+    if response.status_code >= 400:
+        return UNKNOWN, None, f"unconfirmed Buy Me a Coffee HTTP {response.status_code}"
+    if response.status_code != 200 or not final_matches:
+        return UNKNOWN, None, "unexpected Buy Me a Coffee final URL"
+
+    if (
+        canonical_matches
+        and og_url_matches
+        and page_data.get("component") == "Home/HomeLayout"
+        and public_username == expected_username
+        and bool(public_name)
+        and stable_id.isdigit()
+        and heading is not None
+        and heading_text in expected_headings
+        and title == public_name
+    ):
+        return (
+            FOUND,
+            response.url,
+            "public Buy Me a Coffee profile found; identity not verified",
+        )
+
+    return POSSIBLE, profile_url, "incomplete Buy Me a Coffee profile evidence"
+
+
+# ============================================================
+# SPECJALNA DETEKCJA PROFILI INSTRUCTABLES
+# ============================================================
+
+def _instructables_profile_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        ("instructables.com", "www.instructables.com"),
+        f"/member/{username}",
+    )
+
+
+def _instructables_page_context(soup):
+    node = soup.select_one('script#js-page-context[type="application/json"]')
+    if node is None:
+        return {}
+    try:
+        value = json.loads(node.string or node.get_text())
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def classify_instructables_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(
+        response,
+        "Instructables",
+    )
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    canonical_url = _public_profile_canonical(soup)
+    og_title = _public_profile_meta(soup, "property", "og:title")
+    expected_username = username.casefold()
+    final_matches = _instructables_profile_url_matches(response.url, username)
+    canonical_matches = _instructables_profile_url_matches(
+        canonical_url,
+        username,
+    )
+
+    context = _instructables_page_context(soup)
+    profile = context.get("memberProfile", {})
+    if not isinstance(profile, dict):
+        profile = {}
+    public_username = str(profile.get("screenName", "")).casefold()
+    profile_id = str(profile.get("id", ""))
+    dom_ids = {
+        str(node.get("data-member-id"))
+        for node in soup.select("[data-member-id]")
+        if node.get("data-member-id")
+    }
+    stable_ids = {value for value in (profile_id, *dom_ids) if value}
+    main = soup.find("main")
+    main_text = main.get_text(" ", strip=True).casefold() if main else ""
+
+    if (
+        response.status_code == 404
+        and final_matches
+        and canonical_matches
+        and title.casefold() == "page not found - instructables"
+        and "404:" in main_text
+        and "things break sometimes" in main_text
+        and not profile
+        and not stable_ids
+    ):
+        return NOT_FOUND, None, "public Instructables profile not found"
+
+    conflicts = (
+        bool(response.url and not final_matches),
+        bool(canonical_url and not canonical_matches),
+        bool(public_username and public_username != expected_username),
+        len(stable_ids) > 1,
+        any(not re.fullmatch(r"[A-Za-z0-9]+", value) for value in stable_ids),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "Instructables profile evidence conflict"
+
+    if response.status_code >= 400:
+        return UNKNOWN, None, f"unconfirmed Instructables HTTP {response.status_code}"
+    if response.status_code != 200 or not final_matches:
+        return UNKNOWN, None, "unexpected Instructables final URL"
+
+    if (
+        canonical_matches
+        and title.casefold() == expected_username
+        and og_title.casefold() == expected_username
+        and public_username == expected_username
+        and len(stable_ids) == 1
+        and str(profile.get("status", "")).casefold() == "ok"
+        and context.get("remoteHost") == "https://www.instructables.com"
+    ):
+        return (
+            FOUND,
+            response.url,
+            "public Instructables profile found; identity not verified",
+        )
+
+    return POSSIBLE, profile_url, "incomplete Instructables profile evidence"
+
+
+# ============================================================
+# SPECJALNA DETEKCJA PROFILI SCRIBD
+# ============================================================
+
+def _scribd_requested_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        ("scribd.com", "www.scribd.com"),
+        f"/{username}",
+    )
+
+
+def _scribd_profile_parts(value):
+    if not isinstance(value, str) or not value:
+        return None
+    parsed = urlparse(value)
+    if (
+        parsed.scheme not in ("http", "https")
+        or parsed.netloc.casefold() not in ("scribd.com", "www.scribd.com")
+    ):
+        return None
+    match = re.fullmatch(
+        r"/user/(\d+)/([^/?#]+)/?",
+        unquote(parsed.path),
+        re.IGNORECASE,
+    )
+    return (match.group(1), match.group(2)) if match else None
+
+
+def classify_scribd_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(response, "Scribd")
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    canonical_url = _public_profile_canonical(soup)
+    description = _public_profile_meta(soup, "name", "description")
+    expected_username = username.casefold()
+    final_parts = _scribd_profile_parts(response.url)
+    canonical_parts = _scribd_profile_parts(canonical_url)
+
+    alternate_parts = {
+        parts
+        for node in soup.select('link[rel="alternate"][hreflang="x-default"]')
+        for parts in (_scribd_profile_parts(node.get("href", "")),)
+        if parts
+    }
+    image_ids = {
+        match.group(1)
+        for node in soup.select(".profile_image_container img[src]")
+        for match in [
+            re.search(r"/word_user/(\d+)/", node.get("src", ""))
+        ]
+        if match
+    }
+    profile_root = soup.select_one(".auto__profiles_show")
+    heading = soup.select_one("h1.profile_name")
+    heading_text = heading.get_text(" ", strip=True) if heading else ""
+
+    if (
+        response.status_code == 404
+        and _scribd_requested_url_matches(response.url, username)
+        and title.casefold() == "page not found | scribd"
+        and soup.find(
+            "h1",
+            string=lambda value: value
+            and value.strip().casefold() == "page not found",
+        )
+        and not canonical_url
+        and profile_root is None
+        and not final_parts
+    ):
+        return NOT_FOUND, None, "public Scribd profile not found"
+
+    stable_ids = {
+        value
+        for value in (
+            final_parts[0] if final_parts else "",
+            canonical_parts[0] if canonical_parts else "",
+            *(parts[0] for parts in alternate_parts),
+            *image_ids,
+        )
+        if value
+    }
+    public_slugs = {
+        value.casefold()
+        for value in (
+            final_parts[1] if final_parts else "",
+            canonical_parts[1] if canonical_parts else "",
+            *(parts[1] for parts in alternate_parts),
+        )
+        if value
+    }
+    conflicts = (
+        bool(response.url and response.status_code == 200 and not final_parts),
+        bool(canonical_url and not canonical_parts),
+        len(stable_ids) > 1,
+        any(not value.isdigit() for value in stable_ids),
+        bool(public_slugs and public_slugs != {expected_username}),
+        bool(heading_text and heading_text.casefold() != expected_username),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "Scribd profile evidence conflict"
+
+    if response.status_code >= 400:
+        return UNKNOWN, None, f"unconfirmed Scribd HTTP {response.status_code}"
+    if response.status_code != 200 or not final_parts:
+        return UNKNOWN, None, "unexpected Scribd final URL"
+
+    title_matches = bool(
+        title.casefold() == f"{heading_text} | scribd".casefold()
+        or title.casefold()
+        == f"{heading_text} ({heading_text}) | scribd".casefold()
+    )
+    description_matches = bool(
+        heading_text
+        and any(
+            marker.casefold() in description.casefold()
+            for marker in (
+                f"{heading_text} has uploaded",
+                f"{heading_text} ({heading_text}) has uploaded",
+            )
+        )
+    )
+    if (
+        canonical_parts == final_parts
+        and alternate_parts == {final_parts}
+        and len(stable_ids) == 1
+        and public_slugs == {expected_username}
+        and profile_root is not None
+        and heading is not None
+        and heading_text.casefold() == expected_username
+        and title_matches
+        and description_matches
+        and (not image_ids or image_ids == {final_parts[0]})
+    ):
+        return (
+            FOUND,
+            response.url,
+            "public Scribd profile found; identity not verified",
+        )
+
+    return POSSIBLE, profile_url, "incomplete Scribd public profile evidence"
+
+
+# ============================================================
 # SPRAWDZANIE JEDNEGO SERWISU
 # ============================================================
 
@@ -7239,6 +7880,63 @@ def check_username_on_site(username, site_name, site_config):
 
         if checker == "audiomack_profile":
             status, link, info = classify_audiomack_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "bitbucket_profile":
+            api_url = (
+                "https://api.bitbucket.org/2.0/workspaces/"
+                f"{quote(username, safe='')}"
+            )
+            api_response = requests.request(
+                method="GET",
+                url=api_url,
+                headers=headers,
+                timeout=timeout,
+                allow_redirects=True,
+            )
+            status, link, info = classify_bitbucket_profile_response(
+                username,
+                response,
+                api_response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "deviantart_profile":
+            status, link, info = classify_deviantart_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "buymeacoffee_profile":
+            status, link, info = classify_buymeacoffee_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "instructables_profile":
+            status, link, info = classify_instructables_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "scribd_profile":
+            status, link, info = classify_scribd_profile_response(
                 username,
                 response,
                 url,

@@ -440,6 +440,7 @@
   },
   "Bitbucket": {
     "url": "https://bitbucket.org/{username}/",
+    "checker": "bitbucket_profile",
     "detect_based_on_message": false,
     "not_found_status_codes": [404],
     "not_found_message": "We can’t find that page",
@@ -545,6 +546,7 @@
   },
   "DeviantArt": {
     "url": "https://www.deviantart.com/{username}",
+    "checker": "deviantart_profile",
     "detect_based_on_message": false,
     "not_found_status_codes": [404],
     "not_found_message": "This page doesn't exist.",
@@ -705,6 +707,7 @@
   },
   "BuyMeACoffee": {
     "url": "https://www.buymeacoffee.com/{username}",
+    "checker": "buymeacoffee_profile",
     "detect_based_on_message": true,
     "not_found_status_codes": [404],
     "not_found_message": "Page Not Found",
@@ -1110,6 +1113,7 @@
   },
   "Instructables": {
     "url": "https://www.instructables.com/member/{username}",
+    "checker": "instructables_profile",
     "detect_based_on_message": true,
     "not_found_status_codes": [404],
     "not_found_message": "Page Not Found",
@@ -1284,6 +1288,7 @@
   },
   "Scribd": {
     "url": "https://scribd.com/{username}",
+    "checker": "scribd_profile",
     "detect_based_on_message": true,
     "not_found_status_codes": [404],
     "not_found_message": "Page Not Found",

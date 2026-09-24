@@ -4866,6 +4866,409 @@ class AudiomackProfileDetectionTests(
         self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
 
 
+class BitbucketProfileDetectionTests(unittest.TestCase):
+    username = "Test_User"
+    site_name = "Bitbucket"
+    site_config = {
+        "url": "https://bitbucket.org/{username}/",
+        "checker": "bitbucket_profile",
+        "rate_limit_delay": 0,
+    }
+    stable_uuid = "12345678-1234-1234-1234-123456789abc"
+
+    def response(self, status_code, text="", url=None, json_data=None):
+        response = Mock()
+        response.status_code = status_code
+        response.text = text
+        response.url = url or "https://bitbucket.org/Test_User/"
+        if json_data is not None:
+            response.json.return_value = json_data
+        else:
+            response.json.side_effect = ValueError
+        return response
+
+    def web_html(self, *, marker_uuid=None):
+        marker_uuid = marker_uuid or self.stable_uuid
+        return f"""
+            <html><head><title>Bitbucket</title></head><body>
+            <meta data-target-workspace-uuid="{marker_uuid}">
+            <div id="workspace-repositories"></div>
+            </body></html>
+        """
+
+    def api_data(self, *, slug="Test_User", uuid=None):
+        uuid = uuid or self.stable_uuid
+        return {
+            "uuid": f"{{{uuid}}}",
+            "name": "Test Workspace",
+            "slug": slug,
+            "type": "workspace",
+            "links": {
+                "html": {"href": f"https://bitbucket.org/{slug}/"},
+            },
+        }
+
+    def check(self, web_response, api_response):
+        with (
+            patch(
+                "main.username.requests.request",
+                side_effect=[web_response, api_response],
+            ),
+            patch("main.username.time.sleep"),
+        ):
+            return check_username_on_site(
+                self.username,
+                self.site_name,
+                self.site_config,
+            )
+
+    def test_bitbucket_certain_found_after_workspace_redirect(self):
+        web = self.response(
+            200,
+            self.web_html(),
+            "https://bitbucket.org/Test_User/workspace/repositories/",
+        )
+        api = self.response(200, json_data=self.api_data())
+        self.assertEqual(self.check(web, api)[1], FOUND)
+
+    def test_bitbucket_confirmed_404_is_not_found(self):
+        html = "<html><head><title>404 — Bitbucket</title></head><body><h1>Resource not found</h1></body></html>"
+        web = self.response(404, html)
+        api = self.response(404, '{"type":"error"}')
+        self.assertEqual(self.check(web, api)[1], NOT_FOUND)
+
+    def test_bitbucket_username_conflict_is_unknown(self):
+        web = self.response(200, self.web_html(), "https://bitbucket.org/Test_User/workspace/repositories/")
+        api = self.response(200, json_data=self.api_data(slug="Other_User"))
+        self.assertEqual(self.check(web, api)[1], UNKNOWN)
+
+    def test_bitbucket_url_conflict_is_unknown(self):
+        web = self.response(200, self.web_html(), "https://bitbucket.org/Other_User/workspace/repositories/")
+        api = self.response(200, json_data=self.api_data())
+        self.assertEqual(self.check(web, api)[1], UNKNOWN)
+
+    def test_bitbucket_stable_id_conflict_is_unknown(self):
+        web = self.response(200, self.web_html(marker_uuid="aaaaaaaa-1234-1234-1234-123456789abc"), "https://bitbucket.org/Test_User/workspace/repositories/")
+        api = self.response(200, json_data=self.api_data())
+        self.assertEqual(self.check(web, api)[1], UNKNOWN)
+
+    def test_bitbucket_incomplete_data_is_possible(self):
+        web = self.response(200, "<html><head><title>Bitbucket</title></head></html>", "https://bitbucket.org/Test_User/workspace/repositories/")
+        api = self.response(200, json_data=self.api_data())
+        self.assertEqual(self.check(web, api)[1], POSSIBLE)
+
+    def test_bitbucket_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403), self.response(200))[1], BLOCKED)
+
+    def test_bitbucket_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429), self.response(200))[1], RATE_LIMIT)
+
+
+class DeviantArtProfileDetectionTests(PublicProfileCheckerMixin, unittest.TestCase):
+    site_name = "DeviantArt"
+    default_url = "https://www.deviantart.com/Test_User"
+    site_config = {
+        "url": "https://www.deviantart.com/{username}",
+        "checker": "deviantart_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def profile_html(
+        self,
+        *,
+        current_username="Test_User",
+        alias=None,
+        identifiers=(),
+        include_schema=True,
+    ):
+        profile_url = f"https://www.deviantart.com/{current_username}"
+        schema = ""
+        if include_schema:
+            person = {
+                "@type": "Person",
+                "@id": f"{profile_url}#person",
+                "name": current_username,
+                "url": profile_url,
+            }
+            if alias:
+                person["alternateName"] = alias
+            if identifiers:
+                person["identifier"] = identifiers[-1]
+            page = {
+                "@type": "ProfilePage",
+                "@id": profile_url,
+                "url": profile_url,
+                "name": f"{current_username} on DeviantArt",
+                "mainEntity": person,
+            }
+            if identifiers:
+                page["identifier"] = identifiers[0]
+            schema = f'<script type="application/ld+json">{json.dumps(page)}</script>'
+        return f"""
+            <html><head><title>{current_username} on DeviantArt</title>
+            <link rel="canonical" href="{profile_url}">
+            <meta property="og:url" content="{profile_url}">{schema}
+            </head><body><h1>{current_username}</h1></body></html>
+        """
+
+    def test_deviantart_certain_found(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html()))[1], FOUND)
+
+    def test_deviantart_confirmed_alias_found(self):
+        html = self.profile_html(current_username="New_User", alias="Test_User")
+        response = self.response(200, html, "https://www.deviantart.com/New_User")
+        self.assertEqual(self.check(response)[1], FOUND)
+
+    def test_deviantart_unconfirmed_alias_is_unknown(self):
+        html = self.profile_html(current_username="New_User")
+        response = self.response(200, html, "https://www.deviantart.com/New_User")
+        self.assertEqual(self.check(response)[1], UNKNOWN)
+
+    def test_deviantart_confirmed_404_is_not_found(self):
+        html = "<html><head><title>DeviantArt: 404</title></head><body><h1>Llama Not Found</h1></body></html>"
+        self.assertEqual(self.check(self.response(404, html))[1], NOT_FOUND)
+
+    def test_deviantart_username_conflict_is_unknown(self):
+        html = self.profile_html(current_username="Other_User")
+        self.assertEqual(self.check(self.response(200, html))[1], UNKNOWN)
+
+    def test_deviantart_url_conflict_is_unknown(self):
+        response = self.response(200, self.profile_html(), "https://www.deviantart.com/Other_User")
+        self.assertEqual(self.check(response)[1], UNKNOWN)
+
+    def test_deviantart_stable_id_conflict_is_unknown(self):
+        html = self.profile_html(identifiers=("12345", "98765"))
+        self.assertEqual(self.check(self.response(200, html))[1], UNKNOWN)
+
+    def test_deviantart_incomplete_data_is_possible(self):
+        html = self.profile_html(include_schema=False)
+        self.assertEqual(self.check(self.response(200, html))[1], POSSIBLE)
+
+    def test_deviantart_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_deviantart_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+
+class BuyMeACoffeeProfileDetectionTests(PublicProfileCheckerMixin, unittest.TestCase):
+    site_name = "BuyMeACoffee"
+    default_url = "https://buymeacoffee.com/Test_User"
+    site_config = {
+        "url": "https://www.buymeacoffee.com/{username}",
+        "checker": "buymeacoffee_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def profile_html(
+        self,
+        *,
+        public_username="Test_User",
+        user_id="12345",
+        include_creator=True,
+        support_heading=False,
+    ):
+        creator = {}
+        if include_creator:
+            creator = {
+                "user_id": int(user_id) if user_id.isdigit() else user_id,
+                "name": "Test Creator",
+                "slug": public_username,
+            }
+        data = {
+            "component": "Home/HomeLayout",
+            "props": {"creator_data": {"data": creator}},
+        }
+        heading = (
+            "Support Test Creator"
+            if support_heading
+            else "Buy Test Creator a coffee"
+        )
+        return f"""
+            <html><head><title>Test Creator</title>
+            <link rel="canonical" href="https://buymeacoffee.com/{public_username}">
+            <meta property="og:url" content="https://buymeacoffee.com/{public_username}">
+            </head><body><h1>{heading}</h1>
+            <script data-page="app" type="application/json">{json.dumps(data)}</script>
+            </body></html>
+        """
+
+    def test_buymeacoffee_certain_found_after_domain_redirect(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html()))[1], FOUND)
+
+    def test_buymeacoffee_support_heading_is_found(self):
+        html = self.profile_html(support_heading=True)
+        self.assertEqual(self.check(self.response(200, html))[1], FOUND)
+
+    def test_buymeacoffee_confirmed_404_is_not_found(self):
+        data = {"component": "Error", "props": {"status": 404}}
+        html = f'<html><head><title>Not found | Buy Me a Coffee</title></head><body><script data-page="app" type="application/json">{json.dumps(data)}</script></body></html>'
+        self.assertEqual(self.check(self.response(404, html))[1], NOT_FOUND)
+
+    def test_buymeacoffee_username_conflict_is_unknown(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html(public_username="Other_User")))[1], UNKNOWN)
+
+    def test_buymeacoffee_url_conflict_is_unknown(self):
+        response = self.response(200, self.profile_html(), "https://buymeacoffee.com/Other_User")
+        self.assertEqual(self.check(response)[1], UNKNOWN)
+
+    def test_buymeacoffee_stable_id_conflict_is_unknown(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html(user_id="invalid")))[1], UNKNOWN)
+
+    def test_buymeacoffee_incomplete_data_is_possible(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html(include_creator=False)))[1], POSSIBLE)
+
+    def test_buymeacoffee_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_buymeacoffee_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+
+class InstructablesProfileDetectionTests(PublicProfileCheckerMixin, unittest.TestCase):
+    site_name = "Instructables"
+    default_url = "https://www.instructables.com/member/Test_User"
+    site_config = {
+        "url": "https://www.instructables.com/member/{username}",
+        "checker": "instructables_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def profile_html(self, *, public_username="Test_User", profile_id="ABC123", dom_id=None, include_profile=True):
+        context = {"remoteHost": "https://www.instructables.com"}
+        if include_profile:
+            context["memberProfile"] = {
+                "screenName": public_username,
+                "id": profile_id,
+                "status": "OK",
+            }
+        marker = f'<div data-member-id="{dom_id}"></div>' if dom_id else ""
+        return f"""
+            <html><head><title>{public_username}</title>
+            <link rel="canonical" href="https://www.instructables.com/member/{public_username}">
+            <meta property="og:title" content="{public_username}"></head>
+            <body>{marker}<script id="js-page-context" type="application/json">{json.dumps(context)}</script></body></html>
+        """
+
+    def test_instructables_certain_found(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html()))[1], FOUND)
+
+    def test_instructables_confirmed_404_is_not_found(self):
+        html = """
+            <html><head><title>Page Not Found - Instructables</title>
+            <link rel="canonical" href="https://www.instructables.com/member/Test_User"></head>
+            <body><main>404: We're sorry, things break sometimes</main></body></html>
+        """
+        self.assertEqual(self.check(self.response(404, html))[1], NOT_FOUND)
+
+    def test_instructables_username_conflict_is_unknown(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html(public_username="Other_User")))[1], UNKNOWN)
+
+    def test_instructables_url_conflict_is_unknown(self):
+        response = self.response(200, self.profile_html(), "https://www.instructables.com/member/Other_User")
+        self.assertEqual(self.check(response)[1], UNKNOWN)
+
+    def test_instructables_stable_id_conflict_is_unknown(self):
+        html = self.profile_html(dom_id="XYZ987")
+        self.assertEqual(self.check(self.response(200, html))[1], UNKNOWN)
+
+    def test_instructables_incomplete_data_is_possible(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html(include_profile=False)))[1], POSSIBLE)
+
+    def test_instructables_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_instructables_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+
+class ScribdProfileDetectionTests(PublicProfileCheckerMixin, unittest.TestCase):
+    site_name = "Scribd"
+    default_url = "https://www.scribd.com/user/12345/Test_User"
+    site_config = {
+        "url": "https://scribd.com/{username}",
+        "checker": "scribd_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def profile_html(
+        self,
+        *,
+        public_username="Test_User",
+        final_id="12345",
+        canonical_id=None,
+        image_id=None,
+        include_marker=True,
+        include_image=True,
+        parenthesized_description=True,
+    ):
+        canonical_id = canonical_id or final_id
+        image_id = image_id or final_id
+        marker = ""
+        if include_marker:
+            image = (
+                f'<div class="profile_image_container"><img src="https://img.scribdassets.com/img/word_user/{image_id}/72x72/x/1"></div>'
+                if include_image
+                else '<div class="profile_image_container"><img alt=""></div>'
+            )
+            marker = f'<div class="auto__profiles_show">{image}<h1 class="profile_name">{public_username}</h1></div>'
+        description_name = (
+            f"{public_username} ({public_username})"
+            if parenthesized_description
+            else public_username
+        )
+        return f"""
+            <html><head><title>{public_username} | Scribd</title>
+            <meta name="description" content="{description_name} has uploaded 0 documents on Scribd.">
+            <link rel="canonical" href="https://www.scribd.com/user/{canonical_id}/{public_username}">
+            <link rel="alternate" hreflang="x-default" href="https://www.scribd.com/user/{canonical_id}/{public_username}">
+            </head><body>{marker}</body></html>
+        """
+
+    def test_scribd_certain_found_after_numeric_redirect(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html()))[1], FOUND)
+
+    def test_scribd_profile_without_avatar_is_found(self):
+        html = self.profile_html(
+            include_image=False,
+            parenthesized_description=False,
+        )
+        self.assertEqual(self.check(self.response(200, html))[1], FOUND)
+
+    def test_scribd_confirmed_404_is_not_found(self):
+        html = "<html><head><title>Page not found | Scribd</title></head><body><h1>Page not found</h1></body></html>"
+        response = self.response(404, html, "https://www.scribd.com/Test_User")
+        self.assertEqual(self.check(response)[1], NOT_FOUND)
+
+    def test_scribd_username_conflict_is_unknown(self):
+        html = self.profile_html(public_username="Other_User")
+        response = self.response(200, html, "https://www.scribd.com/user/12345/Other_User")
+        self.assertEqual(self.check(response)[1], UNKNOWN)
+
+    def test_scribd_url_conflict_is_unknown(self):
+        response = self.response(200, self.profile_html(), "https://www.scribd.com/Other_User")
+        self.assertEqual(self.check(response)[1], UNKNOWN)
+
+    def test_scribd_stable_id_conflict_is_unknown(self):
+        html = self.profile_html(canonical_id="98765")
+        self.assertEqual(self.check(self.response(200, html))[1], UNKNOWN)
+
+    def test_scribd_incomplete_data_is_possible(self):
+        html = self.profile_html(include_marker=False)
+        self.assertEqual(self.check(self.response(200, html))[1], POSSIBLE)
+
+    def test_scribd_unconfirmed_alias_redirect_is_unknown(self):
+        html = self.profile_html(public_username="New_User")
+        response = self.response(200, html, "https://www.scribd.com/user/12345/New_User")
+        self.assertEqual(self.check(response)[1], UNKNOWN)
+
+    def test_scribd_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_scribd_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+
 class FourthPublicProfileCheckerConfigTests(unittest.TestCase):
     def test_five_services_use_dedicated_checkers(self):
         config = load_sites_config()
@@ -4875,6 +5278,22 @@ class FourthPublicProfileCheckerConfigTests(unittest.TestCase):
             "Hashnode": "hashnode_profile",
             "Codewars": "codewars_profile",
             "Audiomack": "audiomack_profile",
+        }
+
+        for service_name, checker in expected.items():
+            with self.subTest(service=service_name):
+                self.assertEqual(config[service_name]["checker"], checker)
+
+
+class FifthPublicProfileCheckerConfigTests(unittest.TestCase):
+    def test_five_services_use_dedicated_checkers(self):
+        config = load_sites_config()
+        expected = {
+            "Bitbucket": "bitbucket_profile",
+            "DeviantArt": "deviantart_profile",
+            "BuyMeACoffee": "buymeacoffee_profile",
+            "Instructables": "instructables_profile",
+            "Scribd": "scribd_profile",
         }
 
         for service_name, checker in expected.items():
