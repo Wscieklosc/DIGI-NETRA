@@ -762,6 +762,7 @@
   },
   "ShareChat": {
     "url": "https://sharechat.com/profile/{username}",
+    "checker": "sharechat_profile",
     "detect_based_on_message": true,
     "not_found_status_codes":[404],
     "not_found_message": "Page Not Found",
@@ -1201,6 +1202,7 @@
   },
   "Peerlist": {
     "url": "https://peerlist.io/{username}",
+    "checker": "peerlist_profile",
     "detect_based_on_message": true,
     "not_found_status_codes": [404],
     "not_found_message": "Page Not Found",
@@ -1236,6 +1238,7 @@
   },
   "Codementor": {
     "url": "https://www.codementor.io/@{username}",
+    "checker": "codementor_profile",
     "detect_based_on_message": true,
     "not_found_status_codes": [404],
     "not_found_message": "Page Not Found",
@@ -1358,6 +1361,7 @@
   },
   "Buzzfeed": {
     "url": "https://buzzfeed.com/{username}",
+    "checker": "buzzfeed_profile",
     "detect_based_on_message": true,
     "not_found_status_codes": [404],
     "not_found_message": "Page Not Found",
@@ -1921,6 +1925,7 @@
   },
   "Houzz": {
     "url": "https://houzz.com/user/{username}",
+    "checker": "houzz_profile",
     "detect_based_on_message": true,
     "not_found_status_codes": [404],
     "not_found_message": "Page Not Found",

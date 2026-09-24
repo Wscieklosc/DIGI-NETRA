@@ -7451,6 +7451,543 @@ def classify_scribd_profile_response(username, response, profile_url):
 
 
 # ============================================================
+# SPECJALNA DETEKCJA PROFILI SHARECHAT
+# ============================================================
+
+def _sharechat_profile_url_matches(value, username):
+    if isinstance(value, str) and value.startswith("/"):
+        value = f"https://sharechat.com{value}"
+    elif isinstance(value, str) and value and "://" not in value:
+        value = f"https://{value.lstrip('/')}"
+    return _public_profile_url_matches(
+        value,
+        ("sharechat.com", "www.sharechat.com"),
+        f"/profile/{username}",
+    )
+
+
+def _sharechat_svelte_profile(html):
+    match = re.search(
+        r'data:\{handle:"(?P<handle>[^"]+)",profile:\{(?P<body>.*?)'
+        r'\}\},uses:\{params:\["handle"\]\}',
+        html,
+        re.DOTALL,
+    )
+    if not match:
+        return {}
+
+    body = match.group("body")
+    public_handle = re.search(r'(?:^|,)h:"([^"]+)"', body)
+    profile_id = re.search(r'(?:^|,)i:"([^"]+)"', body)
+    display_name = re.search(r'(?:^|,)n:"([^"]+)"', body)
+    return {
+        "route_handle": match.group("handle"),
+        "handle": public_handle.group(1) if public_handle else "",
+        "id": profile_id.group(1) if profile_id else "",
+        "name": display_name.group(1) if display_name else "",
+    }
+
+
+def classify_sharechat_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(response, "ShareChat")
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    canonical_url = _public_profile_canonical(soup)
+    og_url = _public_profile_meta(soup, "property", "og:url")
+    expected_username = username.casefold()
+    final_matches = _sharechat_profile_url_matches(response.url, username)
+    canonical_matches = _sharechat_profile_url_matches(canonical_url, username)
+    og_url_matches = _sharechat_profile_url_matches(og_url, username)
+
+    people = [
+        item
+        for document in _public_json_ld_documents(soup)
+        for item in _walk_public_json(document)
+        if item.get("@type") == "Person"
+    ]
+    schema_usernames = {
+        str(item.get("alternateName", "")).casefold()
+        for item in people
+        if item.get("alternateName")
+    }
+    schema_urls = {
+        item.get("url")
+        for item in people
+        if isinstance(item.get("url"), str) and item.get("url")
+    }
+    profile = _sharechat_svelte_profile(response.text)
+    public_handles = {
+        str(value).casefold()
+        for value in (profile.get("route_handle"), profile.get("handle"))
+        if value
+    }
+    stable_id = str(profile.get("id", ""))
+
+    if (
+        response.status_code == 410
+        and final_matches
+        and title.casefold() == "page not found"
+        and not canonical_url
+        and not people
+        and not profile
+    ):
+        return NOT_FOUND, None, "public ShareChat profile not found"
+
+    conflicts = (
+        bool(response.url and not final_matches),
+        bool(canonical_url and not canonical_matches),
+        bool(og_url and not og_url_matches),
+        bool(schema_usernames and schema_usernames != {expected_username}),
+        any(not _sharechat_profile_url_matches(value, username) for value in schema_urls),
+        bool(public_handles and public_handles != {expected_username}),
+        bool(stable_id and not stable_id.isdigit()),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "ShareChat profile evidence conflict"
+
+    if response.status_code >= 400:
+        return UNKNOWN, None, f"unconfirmed ShareChat HTTP {response.status_code}"
+    if response.status_code != 200 or not final_matches:
+        return UNKNOWN, None, "unexpected ShareChat final URL"
+
+    schema_name = str(people[0].get("name", "")) if len(people) == 1 else ""
+    heading = soup.find("h1")
+    heading_text = heading.get_text(" ", strip=True) if heading else ""
+    if (
+        canonical_matches
+        and og_url_matches
+        and len(people) == 1
+        and schema_usernames == {expected_username}
+        and schema_urls
+        and all(_sharechat_profile_url_matches(value, username) for value in schema_urls)
+        and public_handles == {expected_username}
+        and stable_id.isdigit()
+        and profile.get("name") == schema_name == heading_text
+        and f"(@{username})".casefold() in title.casefold()
+        and "sharechat" in title.casefold()
+        and bool(soup.find("main"))
+    ):
+        return FOUND, response.url, "public ShareChat profile found; identity not verified"
+
+    return POSSIBLE, profile_url, "incomplete ShareChat public profile evidence"
+
+
+# ============================================================
+# SPECJALNA DETEKCJA PROFILI PEERLIST
+# ============================================================
+
+def _peerlist_profile_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        ("peerlist.io", "www.peerlist.io"),
+        f"/{username}",
+    )
+
+
+def classify_peerlist_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(response, "Peerlist")
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    canonical_url = _public_profile_canonical(soup)
+    og_url = _public_profile_meta(soup, "property", "og:url")
+    og_title = _public_profile_meta(soup, "property", "og:title")
+    expected_username = username.casefold()
+    final_matches = _peerlist_profile_url_matches(response.url, username)
+    canonical_matches = _peerlist_profile_url_matches(canonical_url, username)
+    og_url_matches = _peerlist_profile_url_matches(og_url, username)
+    next_data = _json_script_by_id(soup, "__NEXT_DATA__")
+    page_props = next_data.get("props", {}).get("pageProps", {})
+    public_user = page_props.get("user", {}) if isinstance(page_props, dict) else {}
+    if not isinstance(public_user, dict):
+        public_user = {}
+    query = next_data.get("query", {})
+    if not isinstance(query, dict):
+        query = {}
+
+    public_handle = str(public_user.get("profileHandle", "")).casefold()
+    query_handle = str(query.get("username", "")).casefold()
+    stable_ids = {
+        str(item.get("id"))
+        for item in _walk_public_json(public_user)
+        if str(item.get("profileHandle", "")).casefold() == expected_username
+        and item.get("id") not in (None, "")
+    }
+
+    if (
+        response.status_code == 404
+        and final_matches
+        and title.casefold() == "peerlist | 404 page not found"
+        and next_data.get("page") == "/404"
+        and not canonical_url
+        and not og_url
+        and not public_user
+    ):
+        return NOT_FOUND, None, "public Peerlist profile not found"
+
+    conflicts = (
+        bool(response.url and not final_matches),
+        bool(canonical_url and not canonical_matches),
+        bool(og_url and not og_url_matches),
+        bool(public_handle and public_handle != expected_username),
+        bool(query_handle and query_handle != expected_username),
+        len(stable_ids) > 1,
+        any(not re.fullmatch(r"[A-Za-z0-9]+", value) for value in stable_ids),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "Peerlist profile evidence conflict"
+
+    if response.status_code >= 400:
+        return UNKNOWN, None, f"unconfirmed Peerlist HTTP {response.status_code}"
+    if response.status_code != 200 or not final_matches:
+        return UNKNOWN, None, "unexpected Peerlist final URL"
+
+    display_name = str(public_user.get("displayName", ""))
+    heading = soup.find("h1")
+    heading_text = heading.get_text(" ", strip=True) if heading else ""
+    if (
+        canonical_matches
+        and og_url_matches
+        and public_handle == expected_username
+        and query_handle == expected_username
+        and next_data.get("page") == "/[username]"
+        and len(stable_ids) == 1
+        and public_user.get("enabled") is True
+        and public_user.get("published") is True
+        and display_name
+        and heading_text == display_name
+        and title == og_title == f"{display_name} • Peerlist"
+        and soup.select_one("#follow-profile") is not None
+    ):
+        return FOUND, response.url, "public Peerlist profile found; identity not verified"
+
+    return POSSIBLE, profile_url, "incomplete Peerlist public profile evidence"
+
+
+# ============================================================
+# SPECJALNA DETEKCJA PROFILI CODEMENTOR
+# ============================================================
+
+def _codementor_profile_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        ("codementor.io", "www.codementor.io"),
+        f"/@{username}",
+    )
+
+
+def classify_codementor_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(response, "Codementor")
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    canonical_url = _public_profile_canonical(soup)
+    og_url = _public_profile_meta(soup, "property", "og:url")
+    og_title = _public_profile_meta(soup, "property", "og:title")
+    og_type = _public_profile_meta(soup, "property", "og:type")
+    expected_username = username.casefold()
+    final_matches = _codementor_profile_url_matches(response.url, username)
+    canonical_matches = _codementor_profile_url_matches(canonical_url, username)
+    og_url_matches = _codementor_profile_url_matches(og_url, username)
+    next_data = _json_script_by_id(soup, "__NEXT_DATA__")
+    initial_state = next_data.get("props", {}).get("pageProps", {}).get("initialState", {})
+    user_profile = initial_state.get("userProfile", {}) if isinstance(initial_state, dict) else {}
+    public_user = user_profile.get("targetUser", {}) if isinstance(user_profile, dict) else {}
+    if not isinstance(public_user, dict):
+        public_user = {}
+    public_username = str(public_user.get("username", "")).casefold()
+    stable_id = str(public_user.get("uuid", ""))
+
+    not_found_asset = soup.select_one('link[href*="assets.codementor.io/404/"]')
+    if (
+        response.status_code == 404
+        and final_matches
+        and title == "Codementor - Instant 1-on-1 Mentor for Programming & Design"
+        and soup.select_one("div.universe") is not None
+        and not_found_asset is not None
+        and not canonical_url
+        and not public_user
+    ):
+        return NOT_FOUND, None, "public Codementor profile not found"
+
+    conflicts = (
+        bool(response.url and not final_matches),
+        bool(canonical_url and not canonical_matches),
+        bool(og_url and not og_url_matches),
+        bool(public_username and public_username != expected_username),
+        bool(stable_id and not re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", stable_id)),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "Codementor profile evidence conflict"
+
+    if response.status_code >= 400:
+        return UNKNOWN, None, f"unconfirmed Codementor HTTP {response.status_code}"
+    if response.status_code != 200 or not final_matches:
+        return UNKNOWN, None, "unexpected Codementor final URL"
+
+    display_name = str(public_user.get("name", ""))
+    heading = soup.find("h1")
+    heading_text = heading.get_text(" ", strip=True) if heading else ""
+    profile_title_matches = bool(
+        title == og_title
+        and title.casefold().startswith(display_name.casefold())
+        and any(
+            marker in title.casefold()
+            for marker in ("codementor", "mentor")
+        )
+    )
+    if (
+        canonical_matches
+        and og_url_matches
+        and public_username == expected_username
+        and stable_id
+        and public_user.get("notFound") is False
+        and display_name
+        and heading_text == display_name
+        and profile_title_matches
+        and og_type.casefold() == "profile"
+        and next_data.get("page") == "/[atUsername]"
+        and str(next_data.get("query", {}).get("atUsername", "")).casefold()
+        == f"@{expected_username}"
+    ):
+        return FOUND, response.url, "public Codementor profile found; identity not verified"
+
+    return POSSIBLE, profile_url, "incomplete Codementor public profile evidence"
+
+
+# ============================================================
+# SPECJALNA DETEKCJA PROFILI BUZZFEED
+# ============================================================
+
+def _buzzfeed_profile_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        ("buzzfeed.com", "www.buzzfeed.com"),
+        f"/{username}",
+    )
+
+
+def classify_buzzfeed_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(response, "BuzzFeed")
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    canonical_url = _public_profile_canonical(soup)
+    description = _public_profile_meta(soup, "name", "description")
+    expected_username = username.casefold()
+    final_matches = _buzzfeed_profile_url_matches(response.url, username)
+    canonical_matches = _buzzfeed_profile_url_matches(canonical_url, username)
+    next_data = _json_script_by_id(soup, "__NEXT_DATA__")
+    page_props = next_data.get("props", {}).get("pageProps", {})
+    if not isinstance(page_props, dict):
+        page_props = {}
+    public_user = page_props.get("user", {})
+    if not isinstance(public_user, dict):
+        public_user = {}
+    public_username = str(public_user.get("username", "")).casefold()
+    user_uuid = str(page_props.get("user_uuid", ""))
+    profile_ids = {
+        str(item.get("id"))
+        for item in _walk_public_json(page_props)
+        if str(item.get("username", "")).casefold() == expected_username
+        and item.get("id") not in (None, "")
+    }
+
+    not_found_heading = soup.find(
+        "h1",
+        string=lambda value: value and value.strip().casefold() == "oops.",
+    )
+    if (
+        response.status_code == 404
+        and final_matches
+        and title.casefold() == "page not found"
+        and not_found_heading is not None
+        and "we can't find the page you're looking for" in soup.get_text(" ", strip=True).casefold()
+        and not canonical_url
+        and not public_user
+    ):
+        return NOT_FOUND, None, "public BuzzFeed profile not found"
+
+    conflicts = (
+        bool(response.url and not final_matches),
+        bool(canonical_url and not canonical_matches),
+        bool(public_username and public_username != expected_username),
+        len(profile_ids) > 1,
+        any(not value.isdigit() for value in profile_ids),
+        bool(user_uuid and not re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", user_uuid)),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "BuzzFeed profile evidence conflict"
+
+    if response.status_code >= 400:
+        return UNKNOWN, None, f"unconfirmed BuzzFeed HTTP {response.status_code}"
+    if response.status_code != 200 or not final_matches:
+        return UNKNOWN, None, "unexpected BuzzFeed final URL"
+
+    display_name = str(public_user.get("displayName", ""))
+    heading = soup.find("h1")
+    heading_text = heading.get_text(" ", strip=True) if heading else ""
+    if (
+        canonical_matches
+        and public_username == expected_username
+        and len(profile_ids) == 1
+        and user_uuid
+        and display_name
+        and heading_text == display_name
+        and title == f"{display_name} on BuzzFeed"
+        and description.casefold() == f"{display_name} ({username}) on buzzfeed".casefold()
+        and next_data.get("page")
+        and soup.find("main") is not None
+        and public_user.get("deleted") is False
+    ):
+        return FOUND, response.url, "public BuzzFeed profile found; identity not verified"
+
+    return POSSIBLE, profile_url, "incomplete BuzzFeed public profile evidence"
+
+
+# ============================================================
+# SPECJALNA DETEKCJA PROFILI HOUZZ
+# ============================================================
+
+def _houzz_requested_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        ("houzz.com", "www.houzz.com"),
+        f"/user/{username}",
+    )
+
+
+def _houzz_profile_redirect(value):
+    if not isinstance(value, str) or not value:
+        return False
+    parsed = urlparse(value)
+    return (
+        parsed.scheme in ("http", "https")
+        and parsed.netloc.casefold() in ("houzz.com", "www.houzz.com")
+        and unquote(parsed.path).casefold().startswith("/professionals/")
+    )
+
+
+def classify_houzz_profile_response(username, response, profile_url):
+    transport_result = _public_profile_transport_result(response, "Houzz")
+    if transport_result:
+        return transport_result
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    canonical_url = _public_profile_canonical(soup)
+    expected_username = username.casefold()
+    final_exact = _houzz_requested_url_matches(response.url, username)
+    final_redirect = _houzz_profile_redirect(response.url)
+    context = _json_script_by_id(soup, "hz-ctx")
+    data = context.get("data", {})
+    if not isinstance(data, dict):
+        data = {}
+    page_name = str(data.get("pageName", ""))
+    stores = data.get("stores", {}).get("data", {})
+    if not isinstance(stores, dict):
+        stores = {}
+
+    page_store = stores.get("PageStore", {}).get("data", {})
+    if not isinstance(page_store, dict):
+        page_store = {}
+    json_canonical = str(page_store.get("canonicalUrl", ""))
+
+    direct_users = []
+    for store_name in ("UserProfileStore", "ProProfileStore"):
+        store = stores.get(store_name, {}).get("data", {})
+        if isinstance(store, dict) and isinstance(store.get("user"), dict):
+            direct_users.append(store["user"])
+    public_usernames = {
+        str(user.get("userName", "")).casefold()
+        for user in direct_users
+        if user.get("userName")
+    }
+    stable_ids = {
+        str(value)
+        for user in direct_users
+        for value in (user.get("id"), user.get("userId"))
+        if value not in (None, "")
+    }
+
+    local_business_urls = {
+        item.get("url")
+        for document in _public_json_ld_documents(soup)
+        for item in _walk_public_json(document)
+        if item.get("@type") == "LocalBusiness"
+        and isinstance(item.get("url"), str)
+        and item.get("url")
+    }
+    final_normalized = (response.url or "").rstrip("/").casefold()
+
+    heading = soup.find("h1")
+    heading_text = heading.get_text(" ", strip=True) if heading else ""
+    if (
+        response.status_code == 404
+        and final_exact
+        and title.casefold() == "page not found"
+        and page_name == "pageNotFound"
+        and heading_text.casefold() == "the page you requested was not found."
+        and not direct_users
+        and not stable_ids
+    ):
+        return NOT_FOUND, None, "public Houzz profile not found"
+
+    conflicts = (
+        bool(response.url and not final_exact and not final_redirect),
+        bool(canonical_url and not _houzz_requested_url_matches(canonical_url, username) and canonical_url.rstrip("/").casefold() != final_normalized),
+        bool(
+            json_canonical
+            and not _houzz_requested_url_matches(json_canonical, username)
+            and json_canonical.rstrip("/").casefold() != final_normalized
+        ),
+        bool(public_usernames and public_usernames != {expected_username}),
+        len(stable_ids) > 1,
+        any(not value.isdigit() for value in stable_ids),
+        any(value.rstrip("/").casefold() != final_normalized for value in local_business_urls),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "Houzz profile evidence conflict"
+
+    if response.status_code >= 400:
+        return UNKNOWN, None, f"unconfirmed Houzz HTTP {response.status_code}"
+    if response.status_code != 200 or not (final_exact or final_redirect):
+        return UNKNOWN, None, "unexpected Houzz final URL"
+
+    user_page_marker = (
+        page_name in ("userProjects", "userProfile")
+        and soup.select_one(".hz-profile-simplified-header") is not None
+        and _houzz_requested_url_matches(json_canonical, username)
+    )
+    pro_page_marker = (
+        page_name == "proProfile"
+        and soup.select_one("#profile-navi") is not None
+        and final_redirect
+        and bool(local_business_urls)
+    )
+    if (
+        public_usernames == {expected_username}
+        and len(direct_users) == 1
+        and len(stable_ids) == 1
+        and heading_text
+        and title
+        and (user_page_marker or pro_page_marker)
+    ):
+        return FOUND, response.url, "public Houzz profile found; identity not verified"
+
+    return POSSIBLE, profile_url, "incomplete Houzz public profile evidence"
+
+
+# ============================================================
 # SPRAWDZANIE JEDNEGO SERWISU
 # ============================================================
 
@@ -7937,6 +8474,51 @@ def check_username_on_site(username, site_name, site_config):
 
         if checker == "scribd_profile":
             status, link, info = classify_scribd_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "sharechat_profile":
+            status, link, info = classify_sharechat_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "peerlist_profile":
+            status, link, info = classify_peerlist_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "codementor_profile":
+            status, link, info = classify_codementor_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "buzzfeed_profile":
+            status, link, info = classify_buzzfeed_profile_response(
+                username,
+                response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "houzz_profile":
+            status, link, info = classify_houzz_profile_response(
                 username,
                 response,
                 url,

@@ -5269,6 +5269,414 @@ class ScribdProfileDetectionTests(PublicProfileCheckerMixin, unittest.TestCase):
         self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
 
 
+class ShareChatProfileDetectionTests(PublicProfileCheckerMixin, unittest.TestCase):
+    site_name = "ShareChat"
+    default_url = "https://sharechat.com/profile/Test_User"
+    site_config = {
+        "url": "https://sharechat.com/profile/{username}",
+        "checker": "sharechat_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def profile_html(
+        self,
+        *,
+        public_username="Test_User",
+        canonical_username="Test_User",
+        profile_id="168412794",
+        include_svelte=True,
+    ):
+        svelte = ""
+        if include_svelte:
+            svelte = f'''<script>data:{{handle:"{public_username}",profile:{{h:"{public_username}",i:"{profile_id}",n:"Test Name"}}}},uses:{{params:["handle"]}}</script>'''
+        schema = {
+            "@context": "https://schema.org",
+            "@type": "Person",
+            "name": "Test Name",
+            "url": f"/profile/{public_username}",
+            "alternateName": public_username,
+        }
+        return f'''
+            <html><head><title>Test Name (@{public_username}) – Videos &amp; Posts | ShareChat</title>
+            <link rel="canonical" href="https://sharechat.com/profile/{canonical_username}">
+            <meta property="og:url" content="sharechat.com/profile/{canonical_username}">
+            <script type="application/ld+json">{json.dumps(schema)}</script></head>
+            <body><main><h1>Test Name</h1></main>{svelte}</body></html>
+        '''
+
+    def test_sharechat_certain_found(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html()))[1], FOUND)
+
+    def test_sharechat_confirmed_410_is_not_found(self):
+        html = '<html><head><title>Page Not Found</title><meta property="og:url" content="sharechat.com/profile/Test_User"></head></html>'
+        self.assertEqual(self.check(self.response(410, html))[1], NOT_FOUND)
+
+    def test_sharechat_username_conflict_is_unknown(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html(public_username="Other_User")))[1], UNKNOWN)
+
+    def test_sharechat_url_conflict_is_unknown(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html(canonical_username="Other_User")))[1], UNKNOWN)
+
+    def test_sharechat_stable_id_conflict_is_unknown(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html(profile_id="bad-id")))[1], UNKNOWN)
+
+    def test_sharechat_incomplete_data_is_possible(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html(include_svelte=False)))[1], POSSIBLE)
+
+    def test_sharechat_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_sharechat_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+    def test_sharechat_5xx_is_error(self):
+        self.assertEqual(self.check(self.response(503))[1], ERROR)
+
+
+class PeerlistProfileDetectionTests(PublicProfileCheckerMixin, unittest.TestCase):
+    site_name = "Peerlist"
+    default_url = "https://peerlist.io/Test_User"
+    site_config = {
+        "url": "https://peerlist.io/{username}",
+        "checker": "peerlist_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def profile_html(
+        self,
+        *,
+        public_username="Test_User",
+        canonical_username="Test_User",
+        user_id="UHOKDMGADB6P9G82A6NKQOQKRQLL",
+        nested_id=None,
+        include_marker=True,
+        bundle_text="",
+    ):
+        user = {
+            "profileHandle": public_username,
+            "id": user_id,
+            "displayName": "Test Name",
+            "enabled": True,
+            "published": True,
+        }
+        if nested_id:
+            user["projects"] = [{
+                "creator": {"profileHandle": public_username, "id": nested_id}
+            }]
+        data = {
+            "props": {"pageProps": {"user": user}},
+            "page": "/[username]",
+            "query": {"username": public_username},
+        }
+        marker = '<button id="follow-profile">Follow</button>' if include_marker else ""
+        return f'''
+            <html><head><title>Test Name • Peerlist</title>
+            <link rel="canonical" href="https://peerlist.io/{canonical_username}">
+            <meta property="og:url" content="https://peerlist.io/{canonical_username}">
+            <meta property="og:title" content="Test Name • Peerlist"></head>
+            <body><h1>Test Name</h1>{marker}<script id="__NEXT_DATA__" type="application/json">{json.dumps(data)}</script><script>{bundle_text}</script></body></html>
+        '''
+
+    def test_peerlist_certain_found(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html()))[1], FOUND)
+
+    def test_peerlist_confirmed_404_is_not_found(self):
+        data = {"props": {"pageProps": {}}, "page": "/404", "query": {}}
+        html = f'<html><head><title>Peerlist | 404 Page Not Found</title></head><body><script id="__NEXT_DATA__" type="application/json">{json.dumps(data)}</script></body></html>'
+        self.assertEqual(self.check(self.response(404, html))[1], NOT_FOUND)
+
+    def test_peerlist_username_conflict_is_unknown(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html(public_username="Other_User")))[1], UNKNOWN)
+
+    def test_peerlist_url_conflict_is_unknown(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html(canonical_username="Other_User")))[1], UNKNOWN)
+
+    def test_peerlist_stable_id_conflict_is_unknown(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html(nested_id="OTHERID123456789")))[1], UNKNOWN)
+
+    def test_peerlist_incomplete_data_is_possible(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html(include_marker=False)))[1], POSSIBLE)
+
+    def test_peerlist_bundle_challenge_word_does_not_block(self):
+        html = self.profile_html(bundle_text='const label = "challenge";')
+        self.assertEqual(self.check(self.response(200, html))[1], FOUND)
+
+    def test_peerlist_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_peerlist_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+    def test_peerlist_5xx_is_error(self):
+        self.assertEqual(self.check(self.response(502))[1], ERROR)
+
+
+class CodementorProfileDetectionTests(PublicProfileCheckerMixin, unittest.TestCase):
+    site_name = "Codementor"
+    default_url = "https://www.codementor.io/@Test_User"
+    site_config = {
+        "url": "https://www.codementor.io/@{username}",
+        "checker": "codementor_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def profile_html(
+        self,
+        *,
+        public_username="Test_User",
+        canonical_username="Test_User",
+        user_id="fd7b0104-f876-4fd8-9376-419f309b321a",
+        include_heading=True,
+        title="Test Name's Developer Profile on Codementor",
+    ):
+        user = {
+            "username": public_username,
+            "uuid": user_id,
+            "notFound": False,
+            "name": "Test Name",
+            "level": "mentor",
+        }
+        data = {
+            "props": {"pageProps": {"initialState": {"userProfile": {"targetUser": user}}}},
+            "page": "/[atUsername]",
+            "query": {"atUsername": f"@{public_username}"},
+        }
+        heading = "<h1>Test Name</h1>" if include_heading else ""
+        return f'''
+            <html><head><title>{title}</title>
+            <link rel="canonical" href="https://www.codementor.io/@{canonical_username}">
+            <meta property="og:url" content="https://www.codementor.io/@{canonical_username}">
+            <meta property="og:title" content="{title}">
+            <meta property="og:type" content="profile"></head><body>{heading}
+            <script id="__NEXT_DATA__" type="application/json">{json.dumps(data)}</script></body></html>
+        '''
+
+    def test_codementor_certain_found(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html()))[1], FOUND)
+
+    def test_codementor_mentor_title_is_found(self):
+        html = self.profile_html(title="Test Name - Python Expert and Mentor")
+        self.assertEqual(self.check(self.response(200, html))[1], FOUND)
+
+    def test_codementor_confirmed_404_is_not_found(self):
+        html = '''<html><head><title>Codementor - Instant 1-on-1 Mentor for Programming &amp; Design</title><link href="https://assets.codementor.io/404/bundle.css"></head><body><div class="universe"></div></body></html>'''
+        self.assertEqual(self.check(self.response(404, html))[1], NOT_FOUND)
+
+    def test_codementor_username_conflict_is_unknown(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html(public_username="Other_User")))[1], UNKNOWN)
+
+    def test_codementor_url_conflict_is_unknown(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html(canonical_username="Other_User")))[1], UNKNOWN)
+
+    def test_codementor_stable_id_conflict_is_unknown(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html(user_id="bad-id")))[1], UNKNOWN)
+
+    def test_codementor_incomplete_data_is_possible(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html(include_heading=False)))[1], POSSIBLE)
+
+    def test_codementor_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_codementor_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+    def test_codementor_5xx_is_error(self):
+        self.assertEqual(self.check(self.response(500))[1], ERROR)
+
+
+class BuzzFeedProfileDetectionTests(PublicProfileCheckerMixin, unittest.TestCase):
+    site_name = "Buzzfeed"
+    default_url = "https://www.buzzfeed.com/Test_User"
+    site_config = {
+        "url": "https://buzzfeed.com/{username}",
+        "checker": "buzzfeed_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def profile_html(
+        self,
+        *,
+        public_username="Test_User",
+        canonical_username="Test_User",
+        user_id="14929546",
+        nested_id=None,
+        include_main=True,
+    ):
+        user = {
+            "id": int(user_id) if user_id.isdigit() else user_id,
+            "username": public_username,
+            "displayName": "Test Name",
+            "deleted": False,
+        }
+        page_props = {
+            "user_uuid": "39b1b297-9a92-4636-89cd-e2fee1e8acb9",
+            "user": user,
+        }
+        if nested_id:
+            page_props["comments"] = {"items": [{
+                "user": {"id": int(nested_id), "username": public_username}
+            }]}
+        data = {"props": {"pageProps": page_props}, "page": "/[username]"}
+        main = "<main><h1>Test Name</h1></main>" if include_main else "<h1>Test Name</h1>"
+        return f'''
+            <html><head><title>Test Name on BuzzFeed</title>
+            <link rel="canonical" href="https://www.buzzfeed.com/{canonical_username}">
+            <meta name="description" content="Test Name ({public_username}) on BuzzFeed"></head>
+            <body>{main}<script id="__NEXT_DATA__" type="application/json">{json.dumps(data)}</script></body></html>
+        '''
+
+    def test_buzzfeed_certain_found(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html()))[1], FOUND)
+
+    def test_buzzfeed_confirmed_404_is_not_found(self):
+        html = '''<html><head><title>Page Not Found</title></head><body><h1>Oops.</h1><h2>We can't find the page you're looking for.</h2></body></html>'''
+        self.assertEqual(self.check(self.response(404, html))[1], NOT_FOUND)
+
+    def test_buzzfeed_username_conflict_is_unknown(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html(public_username="Other_User")))[1], UNKNOWN)
+
+    def test_buzzfeed_url_conflict_is_unknown(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html(canonical_username="Other_User")))[1], UNKNOWN)
+
+    def test_buzzfeed_stable_id_conflict_is_unknown(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html(nested_id="777")))[1], UNKNOWN)
+
+    def test_buzzfeed_incomplete_data_is_possible(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html(include_main=False)))[1], POSSIBLE)
+
+    def test_buzzfeed_unconfirmed_redirect_is_unknown(self):
+        response = self.response(200, self.profile_html(), "https://www.buzzfeed.com/Other_User")
+        self.assertEqual(self.check(response)[1], UNKNOWN)
+
+    def test_buzzfeed_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_buzzfeed_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+    def test_buzzfeed_5xx_is_error(self):
+        self.assertEqual(self.check(self.response(503))[1], ERROR)
+
+
+class HouzzProfileDetectionTests(PublicProfileCheckerMixin, unittest.TestCase):
+    site_name = "Houzz"
+    default_url = "https://www.houzz.com/user/Test_User"
+    site_config = {
+        "url": "https://houzz.com/user/{username}",
+        "checker": "houzz_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def profile_html(
+        self,
+        *,
+        public_username="Test_User",
+        canonical_username="Test_User",
+        user_id="1633546",
+        second_id=None,
+        include_marker=True,
+        professional=False,
+    ):
+        user = {
+            "id": int(user_id) if user_id.isdigit() else user_id,
+            "userId": int(second_id or user_id) if str(second_id or user_id).isdigit() else second_id or user_id,
+            "userName": public_username,
+        }
+        store_name = "ProProfileStore" if professional else "UserProfileStore"
+        page_name = "proProfile" if professional else "userProjects"
+        stores = {store_name: {"data": {"user": user}}}
+        if not professional:
+            stores["PageStore"] = {"data": {"canonicalUrl": f"https://www.houzz.com/user/{canonical_username}"}}
+        else:
+            stores["PageStore"] = {"data": {"canonicalUrl": self.default_url}}
+        data = {"data": {"pageName": page_name, "stores": {"data": stores}}}
+        if professional:
+            marker = '<nav id="profile-navi"></nav>' if include_marker else ""
+            schema = {
+                "@context": "https://schema.org",
+                "@type": "LocalBusiness",
+                "url": self.default_url,
+            }
+        else:
+            marker = '<div class="hz-profile-simplified-header"></div>' if include_marker else ""
+            schema = {}
+        schema_html = f'<script type="application/ld+json">{json.dumps(schema)}</script>' if schema else ""
+        return f'''
+            <html><head><title>Test Name | Houzz</title>{schema_html}</head><body>
+            <h1>Test Name</h1>{marker}<script id="hz-ctx" type="application/json">{json.dumps(data)}</script></body></html>
+        '''
+
+    def test_houzz_certain_found(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html()))[1], FOUND)
+
+    def test_houzz_confirmed_404_is_not_found(self):
+        data = {"data": {"pageName": "pageNotFound", "stores": {"data": {}}}}
+        html = f'<html><head><title>Page Not Found</title></head><body><h1>The page you requested was not found.</h1><script id="hz-ctx" type="application/json">{json.dumps(data)}</script></body></html>'
+        self.assertEqual(self.check(self.response(404, html))[1], NOT_FOUND)
+
+    def test_houzz_username_conflict_is_unknown(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html(public_username="Other_User")))[1], UNKNOWN)
+
+    def test_houzz_url_conflict_is_unknown(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html(canonical_username="Other_User")))[1], UNKNOWN)
+
+    def test_houzz_stable_id_conflict_is_unknown(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html(second_id="999999")))[1], UNKNOWN)
+
+    def test_houzz_incomplete_data_is_possible(self):
+        self.assertEqual(self.check(self.response(200, self.profile_html(include_marker=False)))[1], POSSIBLE)
+
+    def test_houzz_confirmed_professional_redirect_is_found(self):
+        final_url = "https://www.houzz.com/professionals/designers/test-profile-pf~123"
+        old_default = self.default_url
+        try:
+            self.default_url = final_url
+            html = self.profile_html(professional=True)
+        finally:
+            self.default_url = old_default
+        self.assertEqual(self.check(self.response(200, html, final_url))[1], FOUND)
+
+    def test_houzz_unconfirmed_redirect_is_unknown(self):
+        response = self.response(200, self.profile_html(), "https://www.houzz.com/something/else")
+        self.assertEqual(self.check(response)[1], UNKNOWN)
+
+    def test_houzz_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_houzz_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+    def test_houzz_5xx_is_error(self):
+        self.assertEqual(self.check(self.response(500))[1], ERROR)
+
+
+class SixthPublicProfileNetworkErrorTests(unittest.TestCase):
+    def test_network_errors_are_error_for_all_five_checkers(self):
+        configs = {
+            "ShareChat": ("https://sharechat.com/profile/{username}", "sharechat_profile"),
+            "Peerlist": ("https://peerlist.io/{username}", "peerlist_profile"),
+            "Codementor": ("https://www.codementor.io/@{username}", "codementor_profile"),
+            "Buzzfeed": ("https://buzzfeed.com/{username}", "buzzfeed_profile"),
+            "Houzz": ("https://houzz.com/user/{username}", "houzz_profile"),
+        }
+
+        for service_name, (url, checker) in configs.items():
+            with self.subTest(service=service_name), patch(
+                "main.username.requests.request",
+                side_effect=requests.ConnectionError("network unavailable"),
+            ), patch("main.username.time.sleep"):
+                result = check_username_on_site(
+                    "Test_User",
+                    service_name,
+                    {
+                        "url": url,
+                        "checker": checker,
+                        "rate_limit_delay": 0,
+                    },
+                )
+                self.assertEqual(result[1], ERROR)
+
+
 class FourthPublicProfileCheckerConfigTests(unittest.TestCase):
     def test_five_services_use_dedicated_checkers(self):
         config = load_sites_config()
@@ -5294,6 +5702,22 @@ class FifthPublicProfileCheckerConfigTests(unittest.TestCase):
             "BuyMeACoffee": "buymeacoffee_profile",
             "Instructables": "instructables_profile",
             "Scribd": "scribd_profile",
+        }
+
+        for service_name, checker in expected.items():
+            with self.subTest(service=service_name):
+                self.assertEqual(config[service_name]["checker"], checker)
+
+
+class SixthPublicProfileCheckerConfigTests(unittest.TestCase):
+    def test_five_services_use_dedicated_checkers(self):
+        config = load_sites_config()
+        expected = {
+            "ShareChat": "sharechat_profile",
+            "Peerlist": "peerlist_profile",
+            "Codementor": "codementor_profile",
+            "Buzzfeed": "buzzfeed_profile",
+            "Houzz": "houzz_profile",
         }
 
         for service_name, checker in expected.items():
