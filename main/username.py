@@ -8964,10 +8964,18 @@ def classify_wikidot_profile_response(username, response, profile_url):
 # ============================================================
 
 def _tableau_profile_url_matches(value, username):
-    return _public_profile_url_matches(
-        value,
-        ("public.tableau.com",),
-        f"/app/profile/{username}",
+    if not isinstance(value, str) or not value:
+        return False
+
+    parsed = urlparse(value)
+
+    return (
+        parsed.scheme == "https"
+        and parsed.netloc.casefold() == "public.tableau.com"
+        and unquote(parsed.path).rstrip("/").casefold()
+        == f"/app/profile/{username}".casefold()
+        and not parsed.query
+        and not parsed.fragment
     )
 
 
@@ -8977,6 +8985,13 @@ def _tableau_public_json(response):
     except (ValueError, TypeError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def _tableau_has_profile_data(value):
+    if not isinstance(value, dict):
+        return False
+
+    return any(key != "error" for key in value)
 
 
 def classify_tableau_profile_response(
@@ -9034,8 +9049,8 @@ def classify_tableau_profile_response(
         and profile_error_message.casefold()
         == f"author profile not found: {username}".casefold()
         and author_error_message.casefold() == "no such object"
-        and "profileName" not in profile_data
-        and "profileName" not in author_data
+        and not _tableau_has_profile_data(profile_data)
+        and not _tableau_has_profile_data(author_data)
     ):
         return (
             NOT_FOUND,

@@ -6586,6 +6586,95 @@ class TableauPublicProfileDetectionTests(unittest.TestCase):
 
         self.assertEqual(self.check(web, profile, author)[1], UNKNOWN)
 
+    def test_tableau_public_profile_api_200_author_api_404_is_unknown(self):
+        web = self.response(200, self.app_shell())
+        profile = self.response(200, json_data=self.profile_data())
+        author = self.response(
+            404,
+            json_data={"error": {"message": "No such object"}},
+        )
+
+        self.assertEqual(self.check(web, profile, author)[1], UNKNOWN)
+
+    def test_tableau_public_profile_api_404_author_api_200_is_unknown(self):
+        web = self.response(200, self.app_shell())
+        profile = self.response(
+            404,
+            json_data={
+                "error": {
+                    "message": "Author profile not found: Test_User",
+                }
+            },
+        )
+        author = self.response(200, json_data=self.author_data())
+
+        self.assertEqual(self.check(web, profile, author)[1], UNKNOWN)
+
+    def test_tableau_public_api_403_is_blocked(self):
+        web = self.response(200, self.app_shell())
+        profile = self.response(403)
+        author = self.response(200, json_data=self.author_data())
+
+        self.assertEqual(self.check(web, profile, author)[1], BLOCKED)
+
+    def test_tableau_public_api_429_is_rate_limited(self):
+        web = self.response(200, self.app_shell())
+        profile = self.response(200, json_data=self.profile_data())
+        author = self.response(429)
+
+        self.assertEqual(self.check(web, profile, author)[1], RATE_LIMIT)
+
+    def test_tableau_public_http_final_url_is_unknown(self):
+        web = self.response(
+            200,
+            self.app_shell(),
+            "http://public.tableau.com/app/profile/Test_User",
+        )
+        profile = self.response(200, json_data=self.profile_data())
+        author = self.response(200, json_data=self.author_data())
+
+        self.assertEqual(self.check(web, profile, author)[1], UNKNOWN)
+
+    def test_tableau_public_query_final_url_is_unknown(self):
+        web = self.response(
+            200,
+            self.app_shell(),
+            "https://public.tableau.com/app/profile/Test_User?source=test",
+        )
+        profile = self.response(200, json_data=self.profile_data())
+        author = self.response(200, json_data=self.author_data())
+
+        self.assertEqual(self.check(web, profile, author)[1], UNKNOWN)
+
+    def test_tableau_public_fragment_final_url_is_unknown(self):
+        web = self.response(
+            200,
+            self.app_shell(),
+            "https://public.tableau.com/app/profile/Test_User#profile",
+        )
+        profile = self.response(200, json_data=self.profile_data())
+        author = self.response(200, json_data=self.author_data())
+
+        self.assertEqual(self.check(web, profile, author)[1], UNKNOWN)
+
+    def test_tableau_public_404_with_profile_data_is_unknown(self):
+        web = self.response(200, self.app_shell())
+        profile = self.response(
+            404,
+            json_data={
+                "error": {
+                    "message": "Author profile not found: Test_User",
+                },
+                "profileName": "Test_User",
+            },
+        )
+        author = self.response(
+            404,
+            json_data={"error": {"message": "No such object"}},
+        )
+
+        self.assertEqual(self.check(web, profile, author)[1], UNKNOWN)
+
     def test_tableau_public_403_is_blocked(self):
         self.assertEqual(self.check(self.response(403))[1], BLOCKED)
 
