@@ -6392,6 +6392,246 @@ class WikidotProfileDetectionTests(PublicProfileCheckerMixin, unittest.TestCase)
         self.assertEqual(self.check(self.response(503))[1], ERROR)
 
 
+class TableauPublicProfileDetectionTests(unittest.TestCase):
+    username = "Test_User"
+    site_name = "Tableau Public"
+    site_config = {
+        "url": "https://public.tableau.com/app/profile/{username}",
+        "checker": "tableau_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def response(self, status_code, text="", url=None, json_data=None):
+        response = Mock()
+        response.status_code = status_code
+        response.text = text
+        response.url = (
+            url
+            or "https://public.tableau.com/app/profile/Test_User"
+        )
+        if json_data is None:
+            response.json.side_effect = ValueError
+        else:
+            response.json.return_value = json_data
+        return response
+
+    def app_shell(self):
+        return '''
+            <html><head>
+            <script type="module" src="/app/assets/main-example.js"></script>
+            </head><body><div id="root"></div></body></html>
+        '''
+
+    def profile_data(self, *, username="Test_User", **overrides):
+        data = {
+            "profileName": username,
+            "name": "Test User",
+            "title": "Data Analyst",
+            "organization": "Example",
+            "address": '{"city":"Warsaw","country":"Poland"}',
+            "bio": "Public Tableau author",
+            "avatarUrl": (
+                "https://public.tableau.com/avatar/"
+                "11111111-2222-3333-4444-555555555555.jpeg"
+            ),
+            "visibleWorkbookCount": 3,
+            "visibleDataSourceCount": 1,
+            "totalNumberOfFollowers": 5,
+            "totalNumberOfFollowing": 2,
+            "searchable": True,
+            "freelance": False,
+            "askMeAboutMyViz": True,
+            "hideNewWorkbooks": False,
+            "showWebsites": True,
+            "profileView": "PUBLISHED_DATE",
+            "createdAt": 1600000000000,
+            "websites": [],
+            "achievements": [],
+        }
+        data.update(overrides)
+        return data
+
+    def author_data(self, *, username="Test_User", **overrides):
+        data = {
+            "profileName": username,
+            "name": "Test User",
+            "title": "Data Analyst",
+            "organization": "Example",
+            "address": '{"city":"Warsaw","country":"Poland"}',
+            "bio": "Public Tableau author",
+            "avatarUrl": (
+                "https://public.tableau.com/avatar/"
+                "11111111-2222-3333-4444-555555555555.jpeg"
+            ),
+            "freelance": False,
+            "askMeAboutMyViz": True,
+        }
+        data.update(overrides)
+        return data
+
+    def check(self, web_response, profile_response=None, author_response=None):
+        responses = [web_response]
+        if profile_response is not None:
+            responses.append(profile_response)
+        if author_response is not None:
+            responses.append(author_response)
+        with (
+            patch("main.username.requests.request", side_effect=responses),
+            patch("main.username.time.sleep"),
+        ):
+            return check_username_on_site(
+                self.username,
+                self.site_name,
+                self.site_config,
+            )
+
+    def test_tableau_public_certain_found(self):
+        web = self.response(200, self.app_shell())
+        profile = self.response(200, json_data=self.profile_data())
+        author = self.response(200, json_data=self.author_data())
+
+        result = self.check(web, profile, author)
+
+        self.assertEqual(result[1], FOUND)
+        self.assertEqual(
+            result[3],
+            "public Tableau Public profile found; identity not verified",
+        )
+
+    def test_tableau_public_confirmed_not_found(self):
+        web = self.response(200, self.app_shell())
+        profile = self.response(
+            404,
+            json_data={
+                "error": {
+                    "message": "Author profile not found: Test_User",
+                    "id": "request-one",
+                }
+            },
+        )
+        author = self.response(
+            404,
+            json_data={
+                "error": {
+                    "message": "No such object",
+                    "id": "request-two",
+                }
+            },
+        )
+
+        self.assertEqual(self.check(web, profile, author)[1], NOT_FOUND)
+
+    def test_tableau_public_username_conflict_is_unknown(self):
+        web = self.response(200, self.app_shell())
+        profile = self.response(
+            200,
+            json_data=self.profile_data(username="Other_User"),
+        )
+        author = self.response(200, json_data=self.author_data())
+
+        self.assertEqual(self.check(web, profile, author)[1], UNKNOWN)
+
+    def test_tableau_public_url_conflict_is_unknown(self):
+        web = self.response(
+            200,
+            self.app_shell(),
+            "https://public.tableau.com/app/profile/Other_User",
+        )
+        profile = self.response(200, json_data=self.profile_data())
+        author = self.response(200, json_data=self.author_data())
+
+        self.assertEqual(self.check(web, profile, author)[1], UNKNOWN)
+
+    def test_tableau_public_cross_api_conflict_is_unknown(self):
+        web = self.response(200, self.app_shell())
+        profile = self.response(200, json_data=self.profile_data())
+        author = self.response(
+            200,
+            json_data=self.author_data(
+                avatarUrl=(
+                    "https://public.tableau.com/avatar/"
+                    "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jpeg"
+                )
+            ),
+        )
+
+        self.assertEqual(self.check(web, profile, author)[1], UNKNOWN)
+
+    def test_tableau_public_incomplete_data_is_possible(self):
+        web = self.response(200, self.app_shell())
+        incomplete = self.profile_data()
+        incomplete.pop("profileView")
+        profile = self.response(200, json_data=incomplete)
+        author = self.response(200, json_data=self.author_data())
+
+        self.assertEqual(self.check(web, profile, author)[1], POSSIBLE)
+
+    def test_tableau_public_generic_shell_200_is_not_found_evidence(self):
+        web = self.response(200, self.app_shell())
+        profile = self.response(200, json_data={})
+        author = self.response(200, json_data={})
+
+        self.assertEqual(self.check(web, profile, author)[1], POSSIBLE)
+
+    def test_tableau_public_unconfirmed_404_is_unknown(self):
+        web = self.response(200, self.app_shell())
+        profile = self.response(
+            404,
+            json_data={"error": {"message": "Temporary lookup error"}},
+        )
+        author = self.response(
+            404,
+            json_data={"error": {"message": "No such object"}},
+        )
+
+        self.assertEqual(self.check(web, profile, author)[1], UNKNOWN)
+
+    def test_tableau_public_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_tableau_public_429_is_rate_limited(self):
+        self.assertEqual(self.check(self.response(429))[1], RATE_LIMIT)
+
+    def test_tableau_public_5xx_is_error(self):
+        self.assertEqual(self.check(self.response(503))[1], ERROR)
+
+    def test_tableau_public_api_5xx_is_error(self):
+        web = self.response(200, self.app_shell())
+        profile = self.response(503)
+        author = self.response(200, json_data=self.author_data())
+
+        self.assertEqual(self.check(web, profile, author)[1], ERROR)
+
+    def test_tableau_public_network_failure_is_error(self):
+        web = self.response(200, self.app_shell())
+        with (
+            patch(
+                "main.username.requests.request",
+                side_effect=[
+                    web,
+                    requests.ConnectionError("network unavailable"),
+                ],
+            ),
+            patch("main.username.time.sleep"),
+        ):
+            result = check_username_on_site(
+                self.username,
+                self.site_name,
+                self.site_config,
+            )
+
+        self.assertEqual(result[1], ERROR)
+
+    def test_tableau_public_config_uses_current_endpoint_and_checker(self):
+        config = load_sites_config()["Tableau Public"]
+
+        self.assertEqual(
+            config["url"],
+            "https://public.tableau.com/app/profile/{username}",
+        )
+        self.assertEqual(config["checker"], "tableau_profile")
+
+
 class EighthPublicProfileNetworkErrorTests(unittest.TestCase):
     def test_network_errors_are_error_for_all_five_checkers(self):
         configs = {

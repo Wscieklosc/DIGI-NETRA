@@ -8960,6 +8960,220 @@ def classify_wikidot_profile_response(username, response, profile_url):
 
 
 # ============================================================
+# SPECJALNA DETEKCJA PROFILI TABLEAU PUBLIC
+# ============================================================
+
+def _tableau_profile_url_matches(value, username):
+    return _public_profile_url_matches(
+        value,
+        ("public.tableau.com",),
+        f"/app/profile/{username}",
+    )
+
+
+def _tableau_public_json(response):
+    try:
+        value = response.json()
+    except (ValueError, TypeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def classify_tableau_profile_response(
+    username,
+    response,
+    profile_response,
+    author_response,
+    profile_url,
+):
+    for public_response, service_name in (
+        (response, "Tableau Public"),
+        (profile_response, "Tableau Public profile API"),
+        (author_response, "Tableau Public author API"),
+    ):
+        transport_result = _public_profile_transport_result(
+            public_response,
+            service_name,
+        )
+        if transport_result:
+            return transport_result
+
+    final_matches = _tableau_profile_url_matches(
+        response.url,
+        username,
+    )
+    profile_data = _tableau_public_json(profile_response)
+    author_data = _tableau_public_json(author_response)
+    expected_username = username.casefold()
+
+    profile_error = (
+        profile_data.get("error")
+        if isinstance(profile_data, dict)
+        else None
+    )
+    author_error = (
+        author_data.get("error")
+        if isinstance(author_data, dict)
+        else None
+    )
+    profile_error_message = (
+        str(profile_error.get("message", ""))
+        if isinstance(profile_error, dict)
+        else ""
+    )
+    author_error_message = (
+        str(author_error.get("message", ""))
+        if isinstance(author_error, dict)
+        else ""
+    )
+
+    if (
+        profile_response.status_code == 404
+        and author_response.status_code == 404
+        and final_matches
+        and profile_error_message.casefold()
+        == f"author profile not found: {username}".casefold()
+        and author_error_message.casefold() == "no such object"
+        and "profileName" not in profile_data
+        and "profileName" not in author_data
+    ):
+        return (
+            NOT_FOUND,
+            None,
+            "public Tableau Public profile not found",
+        )
+
+    if profile_data is None or author_data is None:
+        return UNKNOWN, None, "invalid Tableau Public API response"
+
+    public_username = str(profile_data.get("profileName", ""))
+    author_username = str(author_data.get("profileName", ""))
+    profile_name = str(profile_data.get("name", ""))
+    author_name = str(author_data.get("name", ""))
+
+    count_fields = (
+        "visibleWorkbookCount",
+        "visibleDataSourceCount",
+        "totalNumberOfFollowers",
+        "totalNumberOfFollowing",
+    )
+    boolean_fields = (
+        "searchable",
+        "freelance",
+        "askMeAboutMyViz",
+        "hideNewWorkbooks",
+        "showWebsites",
+    )
+    shared_fields = (
+        "name",
+        "title",
+        "organization",
+        "address",
+        "bio",
+        "avatarUrl",
+        "freelance",
+        "askMeAboutMyViz",
+    )
+
+    conflicts = (
+        bool(response.url and not final_matches),
+        bool(public_username and public_username.casefold() != expected_username),
+        bool(author_username and author_username.casefold() != expected_username),
+        bool(profile_name and author_name and profile_name != author_name),
+        any(
+            field in profile_data
+            and field in author_data
+            and profile_data[field] != author_data[field]
+            for field in shared_fields
+        ),
+        any(
+            field in profile_data
+            and (
+                not isinstance(profile_data[field], int)
+                or isinstance(profile_data[field], bool)
+                or profile_data[field] < 0
+            )
+            for field in count_fields
+        ),
+        any(
+            field in profile_data
+            and not isinstance(profile_data[field], bool)
+            for field in boolean_fields
+        ),
+        bool(
+            "createdAt" in profile_data
+            and (
+                not isinstance(profile_data["createdAt"], int)
+                or isinstance(profile_data["createdAt"], bool)
+                or profile_data["createdAt"] <= 0
+            )
+        ),
+        bool(
+            profile_response.status_code == 404
+            and author_response.status_code == 200
+        ),
+        bool(
+            profile_response.status_code == 200
+            and author_response.status_code == 404
+        ),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "Tableau Public profile evidence conflict"
+
+    if (
+        response.status_code >= 400
+        or profile_response.status_code >= 400
+        or author_response.status_code >= 400
+    ):
+        return UNKNOWN, None, "unconfirmed Tableau Public response"
+
+    if (
+        response.status_code != 200
+        or profile_response.status_code != 200
+        or author_response.status_code != 200
+        or not final_matches
+    ):
+        return UNKNOWN, None, "unexpected Tableau Public response"
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    app_shell = bool(
+        soup.select_one("#root")
+        and soup.select_one('script[type="module"][src^="/app/assets/main-"]')
+    )
+    structural_profile = bool(
+        public_username.casefold() == expected_username
+        and author_username.casefold() == expected_username
+        and profile_name
+        and author_name
+        and all(
+            isinstance(profile_data.get(field), int)
+            and not isinstance(profile_data.get(field), bool)
+            and profile_data[field] >= 0
+            for field in count_fields
+        )
+        and all(
+            isinstance(profile_data.get(field), bool)
+            for field in boolean_fields
+        )
+        and isinstance(profile_data.get("websites"), list)
+        and isinstance(profile_data.get("achievements"), list)
+        and bool(profile_data.get("profileView"))
+        and profile_data.get("freelance") == author_data.get("freelance")
+        and profile_data.get("askMeAboutMyViz")
+        == author_data.get("askMeAboutMyViz")
+    )
+
+    if app_shell and structural_profile:
+        return (
+            FOUND,
+            profile_url,
+            "public Tableau Public profile found; identity not verified",
+        )
+
+    return POSSIBLE, profile_url, "incomplete Tableau Public profile evidence"
+
+
+# ============================================================
 # SPRAWDZANIE JEDNEGO SERWISU
 # ============================================================
 
@@ -9605,6 +9819,48 @@ def check_username_on_site(username, site_name, site_config):
             status, link, info = classify_wikidot_profile_response(
                 username,
                 response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "tableau_profile":
+            web_transport_result = _public_profile_transport_result(
+                response,
+                "Tableau Public",
+            )
+            if web_transport_result:
+                status, link, info = web_transport_result
+                return site_name, status, link, info
+
+            encoded_username = quote(username, safe="")
+            profile_api_url = (
+                "https://public.tableau.com/public/apis/bff/v1/"
+                f"author-profile/{encoded_username}"
+            )
+            author_api_url = (
+                "https://public.tableau.com/public/apis/v1/authors/"
+                f"{encoded_username}"
+            )
+            profile_response = requests.request(
+                method="GET",
+                url=profile_api_url,
+                headers=headers,
+                timeout=timeout,
+                allow_redirects=True,
+            )
+            author_response = requests.request(
+                method="GET",
+                url=author_api_url,
+                headers=headers,
+                timeout=timeout,
+                allow_redirects=True,
+            )
+            status, link, info = classify_tableau_profile_response(
+                username,
+                response,
+                profile_response,
+                author_response,
                 url,
             )
 
