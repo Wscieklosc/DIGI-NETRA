@@ -6721,6 +6721,228 @@ class TableauPublicProfileDetectionTests(unittest.TestCase):
         self.assertEqual(config["checker"], "tableau_profile")
 
 
+class DailymotionProfileDetectionTests(unittest.TestCase):
+    username = "Test_User"
+    site_name = "Dailymotion"
+    site_config = {
+        "url": "https://www.dailymotion.com/{username}",
+        "checker": "dailymotion_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def response(self, status_code, text="", url=None, json_data=None):
+        response = Mock()
+        response.status_code = status_code
+        response.text = text
+        response.url = url or "https://www.dailymotion.com/Test_User"
+        if json_data is None:
+            response.json.side_effect = ValueError
+        else:
+            response.json.return_value = json_data
+        return response
+
+    def profile_data(self, **overrides):
+        data = {
+            "id": "x123abc",
+            "screenname": "Test User",
+            "username": "Test_User",
+            "url": "https://www.dailymotion.com/Test_User",
+            "description": "Public profile",
+            "avatar_360_url": "https://s1.dmcdn.net/u/example/360x360",
+        }
+        data.update(overrides)
+        return data
+
+    def not_found_data(self, **overrides):
+        error_data = {
+            "reason": "object_not_found",
+            "object_type": "user",
+            "object_id": "Test_User",
+            "param": "id",
+        }
+        error_data.update(overrides)
+        return {
+            "error": {
+                "code": 404,
+                "message": "Can't find object user for `id' parameter",
+                "type": "not_found",
+                "error_data": error_data,
+            }
+        }
+
+    def check(self, web_response, api_response=None):
+        responses = [web_response]
+        if api_response is not None:
+            responses.append(api_response)
+        with (
+            patch("main.username.requests.request", side_effect=responses),
+            patch("main.username.time.sleep"),
+        ):
+            return check_username_on_site(
+                self.username,
+                self.site_name,
+                self.site_config,
+            )
+
+    def test_dailymotion_certain_found(self):
+        result = self.check(
+            self.response(200),
+            self.response(200, json_data=self.profile_data()),
+        )
+
+        self.assertEqual(result[1], FOUND)
+        self.assertEqual(
+            result[3],
+            "public Dailymotion profile found; identity not verified",
+        )
+
+    def test_dailymotion_confirmed_not_found(self):
+        result = self.check(
+            self.response(200),
+            self.response(404, json_data=self.not_found_data()),
+        )
+
+        self.assertEqual(result[1], NOT_FOUND)
+
+    def test_dailymotion_page_200_without_api_confirmation_is_possible(self):
+        result = self.check(
+            self.response(200),
+            self.response(200, json_data={}),
+        )
+
+        self.assertEqual(result[1], POSSIBLE)
+
+    def test_dailymotion_username_conflict_is_unknown(self):
+        result = self.check(
+            self.response(200),
+            self.response(
+                200,
+                json_data=self.profile_data(username="Other_User"),
+            ),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_dailymotion_empty_id_is_possible(self):
+        result = self.check(
+            self.response(200),
+            self.response(200, json_data=self.profile_data(id="")),
+        )
+
+        self.assertEqual(result[1], POSSIBLE)
+
+    def test_dailymotion_api_url_conflict_is_unknown(self):
+        result = self.check(
+            self.response(200),
+            self.response(
+                200,
+                json_data=self.profile_data(
+                    url="https://www.dailymotion.com/Other_User",
+                ),
+            ),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_dailymotion_final_url_conflict_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                url="https://www.dailymotion.com/Other_User",
+            ),
+            self.response(200, json_data=self.profile_data()),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_dailymotion_unconfirmed_404_is_unknown(self):
+        result = self.check(
+            self.response(200),
+            self.response(
+                404,
+                json_data=self.not_found_data(reason="temporary_error"),
+            ),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_dailymotion_404_with_profile_data_is_unknown(self):
+        payload = self.not_found_data()
+        payload["username"] = "Test_User"
+        result = self.check(
+            self.response(200),
+            self.response(404, json_data=payload),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_dailymotion_page_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_dailymotion_api_403_is_blocked(self):
+        result = self.check(
+            self.response(200),
+            self.response(403),
+        )
+
+        self.assertEqual(result[1], BLOCKED)
+
+    def test_dailymotion_api_429_is_rate_limited(self):
+        result = self.check(
+            self.response(200),
+            self.response(429),
+        )
+
+        self.assertEqual(result[1], RATE_LIMIT)
+
+    def test_dailymotion_api_5xx_is_error(self):
+        result = self.check(
+            self.response(200),
+            self.response(503),
+        )
+
+        self.assertEqual(result[1], ERROR)
+
+    def test_dailymotion_network_failure_is_error(self):
+        web = self.response(200)
+        with (
+            patch(
+                "main.username.requests.request",
+                side_effect=[
+                    web,
+                    requests.ConnectionError("network unavailable"),
+                ],
+            ),
+            patch("main.username.time.sleep"),
+        ):
+            result = check_username_on_site(
+                self.username,
+                self.site_name,
+                self.site_config,
+            )
+
+        self.assertEqual(result[1], ERROR)
+
+    def test_dailymotion_incomplete_200_is_possible(self):
+        incomplete = self.profile_data()
+        incomplete.pop("avatar_360_url")
+        result = self.check(
+            self.response(200),
+            self.response(200, json_data=incomplete),
+        )
+
+        self.assertEqual(result[1], POSSIBLE)
+
+    def test_dailymotion_config_uses_strict_checker(self):
+        config = load_sites_config()["Dailymotion"]
+
+        self.assertEqual(
+            config["url"],
+            "https://www.dailymotion.com/{username}",
+        )
+        self.assertEqual(config["checker"], "dailymotion_profile")
+
+
 class EighthPublicProfileNetworkErrorTests(unittest.TestCase):
     def test_network_errors_are_error_for_all_five_checkers(self):
         configs = {

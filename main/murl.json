@@ -799,6 +799,7 @@
   },
   "Dailymotion": {
     "url": "https://www.dailymotion.com/{username}",
+    "checker": "dailymotion_profile",
     "detect_based_on_message": true,
     "not_found_status_codes": [404],
     "not_found_message": "Page Not Found",

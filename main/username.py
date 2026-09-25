@@ -9189,6 +9189,201 @@ def classify_tableau_profile_response(
 
 
 # ============================================================
+# SPECJALNA DETEKCJA PROFILI DAILYMOTION
+# ============================================================
+
+def _dailymotion_profile_url_matches(value, username):
+    if not isinstance(value, str) or not value:
+        return False
+
+    parsed = urlparse(value)
+
+    return (
+        parsed.scheme == "https"
+        and parsed.netloc.casefold() == "www.dailymotion.com"
+        and unquote(parsed.path).rstrip("/").casefold()
+        == f"/{username}".casefold()
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
+def _dailymotion_normalized_username(value):
+    if not isinstance(value, str):
+        return None
+    return unquote(value).casefold()
+
+
+def _dailymotion_api_json(response):
+    try:
+        value = response.json()
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _dailymotion_has_profile_data(value):
+    if not isinstance(value, dict):
+        return False
+
+    profile_fields = {
+        "id",
+        "screenname",
+        "username",
+        "url",
+        "description",
+        "avatar_360_url",
+    }
+    return any(field in value for field in profile_fields)
+
+
+def classify_dailymotion_profile_response(
+    username,
+    response,
+    api_response,
+    profile_url,
+):
+    for public_response, service_name in (
+        (response, "Dailymotion"),
+        (api_response, "Dailymotion public API"),
+    ):
+        transport_result = _public_profile_transport_result(
+            public_response,
+            service_name,
+        )
+        if transport_result:
+            return transport_result
+
+    final_matches = _dailymotion_profile_url_matches(
+        response.url,
+        username,
+    )
+    data = _dailymotion_api_json(api_response)
+    expected_username = _dailymotion_normalized_username(username)
+
+    if data is None:
+        return UNKNOWN, None, "invalid Dailymotion API response"
+
+    error = data.get("error")
+    error_data = (
+        error.get("error_data")
+        if isinstance(error, dict)
+        else None
+    )
+    error_type = (
+        str(error.get("type", ""))
+        if isinstance(error, dict)
+        else ""
+    )
+    error_reason = (
+        str(error_data.get("reason", ""))
+        if isinstance(error_data, dict)
+        else ""
+    )
+    error_object_type = (
+        str(error_data.get("object_type", ""))
+        if isinstance(error_data, dict)
+        else ""
+    )
+    error_object_id = (
+        str(error_data.get("object_id", ""))
+        if isinstance(error_data, dict)
+        else ""
+    )
+
+    if (
+        api_response.status_code == 404
+        and final_matches
+        and error_type.casefold() == "not_found"
+        and error_reason.casefold() == "object_not_found"
+        and error_object_type.casefold() == "user"
+        and _dailymotion_normalized_username(error_object_id)
+        == expected_username
+        and not _dailymotion_has_profile_data(data)
+    ):
+        return NOT_FOUND, None, "public Dailymotion profile not found"
+
+    public_username = data.get("username")
+    public_id = data.get("id")
+    public_url = data.get("url")
+    screenname = data.get("screenname")
+
+    conflicts = (
+        bool(response.url and not final_matches),
+        bool(
+            public_username is not None
+            and (
+                not isinstance(public_username, str)
+                or _dailymotion_normalized_username(public_username)
+                != expected_username
+            )
+        ),
+        bool(
+            public_url is not None
+            and (
+                not isinstance(public_url, str)
+                or not _dailymotion_profile_url_matches(
+                    public_url,
+                    username,
+                )
+            )
+        ),
+        bool(public_id is not None and not isinstance(public_id, str)),
+        bool(screenname is not None and not isinstance(screenname, str)),
+        bool(
+            "description" in data
+            and not isinstance(data["description"], str)
+        ),
+        bool(
+            "avatar_360_url" in data
+            and not isinstance(data["avatar_360_url"], str)
+        ),
+        bool(error and _dailymotion_has_profile_data(data)),
+        bool(error and api_response.status_code != 404),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "Dailymotion profile evidence conflict"
+
+    if api_response.status_code >= 400:
+        return UNKNOWN, None, "unconfirmed Dailymotion API response"
+
+    if response.status_code != 200 or api_response.status_code != 200:
+        return UNKNOWN, None, "unexpected Dailymotion response"
+
+    required_fields = {
+        "id",
+        "screenname",
+        "username",
+        "url",
+        "description",
+        "avatar_360_url",
+    }
+    complete_profile = bool(
+        required_fields.issubset(data)
+        and isinstance(public_id, str)
+        and public_id.strip()
+        and isinstance(screenname, str)
+        and screenname.strip()
+        and isinstance(public_username, str)
+        and _dailymotion_normalized_username(public_username)
+        == expected_username
+        and isinstance(public_url, str)
+        and _dailymotion_profile_url_matches(public_url, username)
+        and isinstance(data.get("description"), str)
+        and isinstance(data.get("avatar_360_url"), str)
+    )
+
+    if final_matches and complete_profile:
+        return (
+            FOUND,
+            profile_url,
+            "public Dailymotion profile found; identity not verified",
+        )
+
+    return POSSIBLE, profile_url, "incomplete Dailymotion profile evidence"
+
+
+# ============================================================
 # SPRAWDZANIE JEDNEGO SERWISU
 # ============================================================
 
@@ -9876,6 +10071,37 @@ def check_username_on_site(username, site_name, site_config):
                 response,
                 profile_response,
                 author_response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "dailymotion_profile":
+            web_transport_result = _public_profile_transport_result(
+                response,
+                "Dailymotion",
+            )
+            if web_transport_result:
+                status, link, info = web_transport_result
+                return site_name, status, link, info
+
+            encoded_username = quote(username, safe="")
+            api_url = (
+                "https://api.dailymotion.com/user/"
+                f"{encoded_username}?fields="
+                "id,screenname,username,url,description,avatar_360_url"
+            )
+            api_response = requests.request(
+                method="GET",
+                url=api_url,
+                headers=headers,
+                timeout=timeout,
+                allow_redirects=True,
+            )
+            status, link, info = classify_dailymotion_profile_response(
+                username,
+                response,
+                api_response,
                 url,
             )
 
