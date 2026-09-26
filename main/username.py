@@ -9384,6 +9384,211 @@ def classify_dailymotion_profile_response(
 
 
 # ============================================================
+# SPECJALNA DETEKCJA PROFILI 500PX
+# ============================================================
+
+def _fivehundredpx_profile_url_matches(value, username):
+    if not isinstance(value, str) or not value:
+        return False
+
+    parsed = urlparse(value)
+
+    expected_path = (
+        f"/p/{unquote(str(username)).casefold()}"
+    )
+
+    return (
+        parsed.scheme == "https"
+        and parsed.netloc.casefold() == "500px.com"
+        and unquote(parsed.path).casefold()
+        == expected_path
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
+def _fivehundredpx_normalized_username(value):
+    if not isinstance(value, str):
+        return None
+    return unquote(value).casefold()
+
+
+def _fivehundredpx_graphql_json(response):
+    try:
+        value = response.json()
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _fivehundredpx_graphql_url_matches(value):
+    if not isinstance(value, str) or not value:
+        return False
+
+    parsed = urlparse(value)
+    return (
+        parsed.scheme == "https"
+        and parsed.netloc.casefold() == "api-neo.500px.com"
+        and parsed.path == "/graphql"
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
+def _fivehundredpx_is_block_page(response):
+    content = response.text if isinstance(response.text, str) else ""
+    lowered = content.casefold()
+    soup = BeautifulSoup(content, "html.parser")
+    title = soup.title.get_text(" ", strip=True).casefold() if soup.title else ""
+
+    return bool(
+        "cf-chl-" in lowered
+        or soup.select_one(
+            "form#challenge-form, .g-recaptcha, [data-sitekey]"
+        )
+        or title in {
+            "just a moment...",
+            "access denied",
+            "captcha",
+        }
+    )
+
+
+def classify_fivehundredpx_profile_response(
+    username,
+    response,
+    api_response,
+    profile_url,
+):
+    for public_response, service_name in (
+        (response, "500px"),
+        (api_response, "500px public GraphQL"),
+    ):
+        transport_result = _public_profile_transport_result(
+            public_response,
+            service_name,
+        )
+        if transport_result:
+            return transport_result
+
+    if _fivehundredpx_is_block_page(response):
+        return BLOCKED, None, "500px challenge page"
+
+    final_matches = _fivehundredpx_profile_url_matches(
+        response.url,
+        username,
+    )
+    payload = _fivehundredpx_graphql_json(api_response)
+    expected_username = _fivehundredpx_normalized_username(username)
+
+    if payload is None:
+        return UNKNOWN, None, "invalid 500px GraphQL response"
+
+    errors_present = (
+        "errors" in payload
+        and payload.get("errors") not in (None, [])
+    )
+    data = payload.get("data")
+
+    if errors_present:
+        return UNKNOWN, None, "500px GraphQL errors conflict"
+
+    if not isinstance(data, dict):
+        return UNKNOWN, None, "invalid 500px GraphQL structure"
+
+    if response.url and not final_matches:
+        return UNKNOWN, None, "500px final URL conflict"
+
+    if (
+        api_response.url
+        and not _fivehundredpx_graphql_url_matches(api_response.url)
+    ):
+        return UNKNOWN, None, "500px GraphQL URL conflict"
+
+    if response.status_code != 200 or api_response.status_code != 200:
+        return UNKNOWN, None, "unexpected 500px response"
+
+    if "getUser" not in data:
+        return POSSIBLE, profile_url, "incomplete 500px profile evidence"
+
+    if set(data) != {"getUser"}:
+        return UNKNOWN, None, "500px GraphQL structure conflict"
+
+    public_user = data.get("getUser")
+
+    if public_user is None:
+        if final_matches:
+            return NOT_FOUND, None, "public 500px profile not found"
+        return UNKNOWN, None, "500px profile URL conflict"
+
+    if not isinstance(public_user, dict):
+        return UNKNOWN, None, "invalid 500px user data"
+
+    allowed_fields = {
+        "__typename",
+        "id",
+        "username",
+        "displayName",
+    }
+    if not set(public_user).issubset(allowed_fields):
+        return UNKNOWN, None, "500px user structure conflict"
+
+    public_type = public_user.get("__typename")
+    public_id = public_user.get("id")
+    public_username = public_user.get("username")
+    display_name = public_user.get("displayName")
+
+    conflicts = (
+        bool(
+            public_type is not None
+            and (
+                not isinstance(public_type, str)
+                or public_type != "User"
+            )
+        ),
+        bool(
+            public_id is not None
+            and not isinstance(public_id, str)
+        ),
+        bool(
+            public_username is not None
+            and (
+                not isinstance(public_username, str)
+                or _fivehundredpx_normalized_username(public_username)
+                != expected_username
+            )
+        ),
+        bool(
+            display_name is not None
+            and not isinstance(display_name, str)
+        ),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "500px profile evidence conflict"
+
+    complete_profile = bool(
+        set(public_user) == allowed_fields
+        and public_type == "User"
+        and isinstance(public_id, str)
+        and public_id.strip()
+        and isinstance(public_username, str)
+        and _fivehundredpx_normalized_username(public_username)
+        == expected_username
+        and isinstance(display_name, str)
+        and display_name.strip()
+    )
+
+    if final_matches and complete_profile:
+        return (
+            FOUND,
+            profile_url,
+            "public 500px profile found; identity not verified",
+        )
+
+    return POSSIBLE, profile_url, "incomplete 500px profile evidence"
+
+
+# ============================================================
 # SPRAWDZANIE JEDNEGO SERWISU
 # ============================================================
 
@@ -10099,6 +10304,50 @@ def check_username_on_site(username, site_name, site_config):
                 allow_redirects=True,
             )
             status, link, info = classify_dailymotion_profile_response(
+                username,
+                response,
+                api_response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "fivehundredpx_profile":
+            web_transport_result = _public_profile_transport_result(
+                response,
+                "500px",
+            )
+            if web_transport_result:
+                status, link, info = web_transport_result
+                return site_name, status, link, info
+
+            if _fivehundredpx_is_block_page(response):
+                return site_name, BLOCKED, None, "500px challenge page"
+
+            graphql_headers = {
+                **headers,
+                "Content-Type": "application/json",
+                "x-500px-platform": "web",
+            }
+            graphql_payload = {
+                "operationName": "getUserProfile",
+                "variables": {"username": username},
+                "query": (
+                    "query getUserProfile($username: String!) { "
+                    "getUser(username: $username) { "
+                    "__typename id username displayName "
+                    "} }"
+                ),
+            }
+            api_response = requests.request(
+                method="POST",
+                url="https://api-neo.500px.com/graphql",
+                headers=graphql_headers,
+                json=graphql_payload,
+                timeout=timeout,
+                allow_redirects=True,
+            )
+            status, link, info = classify_fivehundredpx_profile_response(
                 username,
                 response,
                 api_response,

@@ -6943,6 +6943,350 @@ class DailymotionProfileDetectionTests(unittest.TestCase):
         self.assertEqual(config["checker"], "dailymotion_profile")
 
 
+class FiveHundredPxProfileDetectionTests(unittest.TestCase):
+    username = "Test_User"
+    site_name = "500px"
+    site_config = {
+        "url": "https://500px.com/p/{username}",
+        "checker": "fivehundredpx_profile",
+        "rate_limit_delay": 0,
+    }
+    missing_json = object()
+
+    def response(
+        self,
+        status_code,
+        text="",
+        url=None,
+        json_data=missing_json,
+    ):
+        response = Mock()
+        response.status_code = status_code
+        response.text = text
+        response.url = url or "https://500px.com/p/Test_User"
+        if json_data is self.missing_json:
+            response.json.side_effect = ValueError
+        else:
+            response.json.return_value = json_data
+        return response
+
+    def profile_data(self, **overrides):
+        data = {
+            "__typename": "User",
+            "id": "stable-user-id-123",
+            "username": "TEST_user",
+            "displayName": "Test User",
+        }
+        data.update(overrides)
+        return {"data": {"getUser": data}}
+
+    def not_found_data(self, **data_overrides):
+        data = {"getUser": None}
+        data.update(data_overrides)
+        return {"data": data}
+
+    def check(self, web_response, api_response=None):
+        responses = [web_response]
+        if api_response is not None:
+            if api_response.url == "https://500px.com/p/Test_User":
+                api_response.url = "https://api-neo.500px.com/graphql"
+            responses.append(api_response)
+        with (
+            patch(
+                "main.username.requests.request",
+                side_effect=responses,
+            ),
+            patch("main.username.time.sleep"),
+        ):
+            return check_username_on_site(
+                self.username,
+                self.site_name,
+                self.site_config,
+            )
+
+    def test_500px_certain_found(self):
+        result = self.check(
+            self.response(200),
+            self.response(200, json_data=self.profile_data()),
+        )
+
+        self.assertEqual(result[1], FOUND)
+        self.assertEqual(
+            result[3],
+            "public 500px profile found; identity not verified",
+        )
+
+    def test_500px_confirmed_not_found(self):
+        result = self.check(
+            self.response(200),
+            self.response(200, json_data=self.not_found_data()),
+        )
+
+        self.assertEqual(result[1], NOT_FOUND)
+
+    def test_500px_page_200_without_valid_api_is_not_found_result(self):
+        result = self.check(
+            self.response(200),
+            self.response(200, json_data={}),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+        self.assertNotEqual(result[1], FOUND)
+
+    def test_500px_username_conflict_is_unknown(self):
+        result = self.check(
+            self.response(200),
+            self.response(
+                200,
+                json_data=self.profile_data(username="Other_User"),
+            ),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_500px_empty_id_is_possible(self):
+        result = self.check(
+            self.response(200),
+            self.response(200, json_data=self.profile_data(id="")),
+        )
+
+        self.assertEqual(result[1], POSSIBLE)
+
+    def test_500px_non_string_id_is_unknown(self):
+        result = self.check(
+            self.response(200),
+            self.response(200, json_data=self.profile_data(id=123)),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_500px_wrong_typename_is_unknown(self):
+        result = self.check(
+            self.response(200),
+            self.response(
+                200,
+                json_data=self.profile_data(__typename="Photo"),
+            ),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_500px_final_url_conflict_is_unknown(self):
+        result = self.check(
+            self.response(200, url="https://500px.com/p/Other_User"),
+            self.response(200, json_data=self.profile_data()),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_500px_graphql_url_conflict_is_unknown(self):
+        result = self.check(
+            self.response(200),
+            self.response(
+                200,
+                url="https://api-neo.500px.com/other",
+                json_data=self.profile_data(),
+            ),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_500px_http_final_url_is_unknown(self):
+        result = self.check(
+            self.response(200, url="http://500px.com/p/Test_User"),
+            self.response(200, json_data=self.profile_data()),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_500px_query_in_final_url_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                url="https://500px.com/p/Test_User?source=test",
+            ),
+            self.response(200, json_data=self.profile_data()),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_500px_fragment_in_final_url_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                url="https://500px.com/p/Test_User#about",
+            ),
+            self.response(200, json_data=self.profile_data()),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_500px_graphql_errors_with_user_data_are_unknown(self):
+        payload = self.profile_data()
+        payload["errors"] = [{"message": "partial failure"}]
+        result = self.check(
+            self.response(200),
+            self.response(200, json_data=payload),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_500px_graphql_errors_with_null_user_are_unknown(self):
+        payload = self.not_found_data()
+        payload["errors"] = [{"message": "lookup failed"}]
+        result = self.check(
+            self.response(200),
+            self.response(200, json_data=payload),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_500px_invalid_json_is_unknown(self):
+        result = self.check(
+            self.response(200),
+            self.response(200),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_500px_incomplete_user_is_possible(self):
+        incomplete = self.profile_data()
+        incomplete["data"]["getUser"].pop("displayName")
+        result = self.check(
+            self.response(200),
+            self.response(200, json_data=incomplete),
+        )
+
+        self.assertEqual(result[1], POSSIBLE)
+
+    def test_500px_null_user_with_extra_data_is_unknown(self):
+        result = self.check(
+            self.response(200),
+            self.response(
+                200,
+                json_data=self.not_found_data(other={"id": "unexpected"}),
+            ),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_500px_page_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_500px_structural_challenge_page_is_blocked(self):
+        result = self.check(
+            self.response(
+                200,
+                text=(
+                    "<html><head><title>Just a moment...</title></head>"
+                    "<body><form id='challenge-form'></form></body></html>"
+                ),
+            ),
+        )
+
+        self.assertEqual(result[1], BLOCKED)
+
+    def test_500px_bundle_word_challenge_does_not_block_found(self):
+        result = self.check(
+            self.response(
+                200,
+                text="<div id='root'></div><script>const challenge = 1;</script>",
+            ),
+            self.response(200, json_data=self.profile_data()),
+        )
+
+        self.assertEqual(result[1], FOUND)
+
+    def test_500px_api_401_is_blocked(self):
+        result = self.check(
+            self.response(200),
+            self.response(401),
+        )
+
+        self.assertEqual(result[1], BLOCKED)
+
+    def test_500px_api_429_is_rate_limited(self):
+        result = self.check(
+            self.response(200),
+            self.response(429),
+        )
+
+        self.assertEqual(result[1], RATE_LIMIT)
+
+    def test_500px_api_5xx_is_error(self):
+        result = self.check(
+            self.response(200),
+            self.response(503),
+        )
+
+        self.assertEqual(result[1], ERROR)
+
+    def test_500px_network_failure_is_error(self):
+        web = self.response(200)
+        with (
+            patch(
+                "main.username.requests.request",
+                side_effect=[
+                    web,
+                    requests.ConnectionError("network unavailable"),
+                ],
+            ),
+            patch("main.username.time.sleep"),
+        ):
+            result = check_username_on_site(
+                self.username,
+                self.site_name,
+                self.site_config,
+            )
+
+        self.assertEqual(result[1], ERROR)
+
+    def test_500px_graphql_request_uses_public_operation(self):
+        web = self.response(200)
+        api = self.response(
+            200,
+            url="https://api-neo.500px.com/graphql",
+            json_data=self.profile_data(),
+        )
+        with (
+            patch(
+                "main.username.requests.request",
+                side_effect=[web, api],
+            ) as request_mock,
+            patch("main.username.time.sleep"),
+        ):
+            result = check_username_on_site(
+                self.username,
+                self.site_name,
+                self.site_config,
+            )
+
+        self.assertEqual(result[1], FOUND)
+        api_call = request_mock.call_args_list[1]
+        self.assertEqual(api_call.kwargs["method"], "POST")
+        self.assertEqual(
+            api_call.kwargs["url"],
+            "https://api-neo.500px.com/graphql",
+        )
+        self.assertEqual(
+            api_call.kwargs["json"]["operationName"],
+            "getUserProfile",
+        )
+        self.assertEqual(
+            api_call.kwargs["json"]["variables"],
+            {"username": self.username},
+        )
+
+    def test_500px_config_uses_current_endpoint_and_checker(self):
+        config = load_sites_config()["500px"]
+
+        self.assertEqual(
+            config["url"],
+            "https://500px.com/p/{username}",
+        )
+        self.assertEqual(config["checker"], "fivehundredpx_profile")
+
+
 class EighthPublicProfileNetworkErrorTests(unittest.TestCase):
     def test_network_errors_are_error_for_all_five_checkers(self):
         configs = {

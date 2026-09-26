@@ -888,7 +888,8 @@
     "confidence_score": 0.85
   },
   "500px": {
-    "url": "https://500px.com/{username}",
+    "url": "https://500px.com/p/{username}",
+    "checker": "fivehundredpx_profile",
     "detect_based_on_message": true,
     "not_found_status_codes": [404],
     "not_found_message": "Page Not Found",
