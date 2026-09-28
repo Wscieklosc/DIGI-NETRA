@@ -7287,6 +7287,413 @@ class FiveHundredPxProfileDetectionTests(unittest.TestCase):
         self.assertEqual(config["checker"], "fivehundredpx_profile")
 
 
+class LeetCodeProfileDetectionTests(unittest.TestCase):
+    username = "Test_User"
+    site_name = "LeetCode"
+    site_config = {
+        "url": "https://leetcode.com/u/{username}/",
+        "checker": "leetcode_profile",
+        "rate_limit_delay": 0,
+    }
+    missing_json = object()
+
+    def response(
+        self,
+        status_code,
+        text="",
+        url=None,
+        json_data=missing_json,
+    ):
+        response = Mock()
+        response.status_code = status_code
+        response.text = text
+        response.url = url or "https://leetcode.com/u/Test_User/"
+        if json_data is self.missing_json:
+            response.json.side_effect = ValueError
+        else:
+            response.json.return_value = json_data
+        return response
+
+    def profile_data(self, **user_overrides):
+        user = {
+            "__typename": "UserNode",
+            "username": "TEST_user",
+            "profile": {
+                "realName": "Test User",
+                "userAvatar": "https://assets.leetcode.com/users/test/avatar.png",
+                "ranking": 123,
+                "reputation": 7,
+            },
+        }
+        user.update(user_overrides)
+        return {"data": {"matchedUser": user}}
+
+    def not_found_data(self, **error_overrides):
+        error = {
+            "message": "That user does not exist.",
+            "locations": [{"line": 2, "column": 3}],
+            "path": ["matchedUser"],
+            "extensions": {"handled": True, "skip_sentry": True},
+        }
+        error.update(error_overrides)
+        return {
+            "errors": [error],
+            "data": {"matchedUser": None},
+        }
+
+    def cloudflare_page(self):
+        return (
+            "<html><head><title>Just a moment...</title></head>"
+            "<body><form id='challenge-form'></form></body></html>"
+        )
+
+    def check(self, web_response, api_response=None):
+        responses = [web_response]
+        if api_response is not None:
+            if api_response.url == "https://leetcode.com/u/Test_User/":
+                api_response.url = "https://leetcode.com/graphql/"
+            responses.append(api_response)
+        with (
+            patch("main.username.requests.request", side_effect=responses),
+            patch("main.username.time.sleep"),
+        ):
+            return check_username_on_site(
+                self.username,
+                self.site_name,
+                self.site_config,
+            )
+
+    def test_leetcode_certain_found_via_public_graphql(self):
+        result = self.check(
+            self.response(403, text=self.cloudflare_page()),
+            self.response(200, json_data=self.profile_data()),
+        )
+
+        self.assertEqual(result[1], FOUND)
+        self.assertEqual(
+            result[3],
+            "public LeetCode profile found; identity not verified",
+        )
+
+    def test_leetcode_confirmed_not_found(self):
+        result = self.check(
+            self.response(403, text=self.cloudflare_page()),
+            self.response(200, json_data=self.not_found_data()),
+        )
+
+        self.assertEqual(result[1], NOT_FOUND)
+
+    def test_leetcode_http_200_without_graphql_confirmation_is_possible(self):
+        result = self.check(
+            self.response(200),
+            self.response(200, json_data={"data": {}}),
+        )
+
+        self.assertEqual(result[1], POSSIBLE)
+        self.assertNotEqual(result[1], FOUND)
+
+    def test_leetcode_username_conflict_is_unknown(self):
+        result = self.check(
+            self.response(200),
+            self.response(
+                200,
+                json_data=self.profile_data(username="Other_User"),
+            ),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_leetcode_final_url_conflict_is_unknown(self):
+        result = self.check(
+            self.response(200, url="https://leetcode.com/u/Other_User/"),
+            self.response(200, json_data=self.profile_data()),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_leetcode_http_final_url_is_unknown(self):
+        result = self.check(
+            self.response(200, url="http://leetcode.com/u/Test_User/"),
+            self.response(200, json_data=self.profile_data()),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_leetcode_query_in_final_url_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                url="https://leetcode.com/u/Test_User/?source=test",
+            ),
+            self.response(200, json_data=self.profile_data()),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_leetcode_fragment_in_final_url_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                url="https://leetcode.com/u/Test_User/#profile",
+            ),
+            self.response(200, json_data=self.profile_data()),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_leetcode_graphql_url_conflict_is_unknown(self):
+        result = self.check(
+            self.response(200),
+            self.response(
+                200,
+                url="https://leetcode.com/graphql/other",
+                json_data=self.profile_data(),
+            ),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_leetcode_graphql_errors_with_user_data_are_unknown(self):
+        payload = self.profile_data()
+        payload["errors"] = [{"message": "partial failure"}]
+        result = self.check(
+            self.response(200),
+            self.response(200, json_data=payload),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_leetcode_null_user_without_exact_error_is_unknown(self):
+        result = self.check(
+            self.response(200),
+            self.response(
+                200,
+                json_data={"data": {"matchedUser": None}},
+            ),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_leetcode_wrong_not_found_error_is_unknown(self):
+        result = self.check(
+            self.response(200),
+            self.response(
+                200,
+                json_data=self.not_found_data(
+                    message="Temporary lookup failure",
+                ),
+            ),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_leetcode_invalid_json_is_unknown(self):
+        result = self.check(
+            self.response(200),
+            self.response(200),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_leetcode_incomplete_profile_is_possible(self):
+        payload = self.profile_data()
+        payload["data"]["matchedUser"].pop("profile")
+        result = self.check(
+            self.response(200),
+            self.response(200, json_data=payload),
+        )
+
+        self.assertEqual(result[1], POSSIBLE)
+
+    def test_leetcode_null_real_name_is_found(self):
+        payload = self.profile_data()
+        payload["data"]["matchedUser"]["profile"]["realName"] = None
+
+        result = self.check(
+            self.response(200),
+            self.response(200, json_data=payload),
+        )
+
+        self.assertEqual(result[1], FOUND)
+
+    def test_leetcode_null_ranking_is_found(self):
+        payload = self.profile_data()
+        payload["data"]["matchedUser"]["profile"]["ranking"] = None
+
+        result = self.check(
+            self.response(200),
+            self.response(200, json_data=payload),
+        )
+
+        self.assertEqual(result[1], FOUND)
+
+    def test_leetcode_missing_ranking_is_found(self):
+        payload = self.profile_data()
+        payload["data"]["matchedUser"]["profile"].pop("ranking")
+
+        result = self.check(
+            self.response(200),
+            self.response(200, json_data=payload),
+        )
+
+        self.assertEqual(result[1], FOUND)
+
+    def test_leetcode_not_found_ignores_locations_and_extensions(self):
+        payload = self.not_found_data(
+            locations=[{"line": 99, "column": 17}],
+            extensions={"handled": False, "new_backend_field": "value"},
+        )
+
+        result = self.check(
+            self.response(200),
+            self.response(200, json_data=payload),
+        )
+
+        self.assertEqual(result[1], NOT_FOUND)
+
+    def test_leetcode_null_user_with_conflicting_data_is_unknown(self):
+        payload = self.not_found_data()
+        payload["data"]["otherUser"] = {"username": "Test_User"}
+
+        result = self.check(
+            self.response(200),
+            self.response(200, json_data=payload),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_leetcode_generic_page_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_leetcode_page_200_challenge_is_blocked(self):
+        self.assertEqual(
+            self.check(self.response(200, text=self.cloudflare_page()))[1],
+            BLOCKED,
+        )
+
+    def test_leetcode_api_403_is_blocked(self):
+        result = self.check(
+            self.response(403, text=self.cloudflare_page()),
+            self.response(403),
+        )
+
+        self.assertEqual(result[1], BLOCKED)
+
+    def test_leetcode_api_401_is_blocked(self):
+        result = self.check(
+            self.response(403, text=self.cloudflare_page()),
+            self.response(401),
+        )
+
+        self.assertEqual(result[1], BLOCKED)
+
+    def test_leetcode_api_200_challenge_is_blocked(self):
+        result = self.check(
+            self.response(403, text=self.cloudflare_page()),
+            self.response(200, text=self.cloudflare_page()),
+        )
+
+        self.assertEqual(result[1], BLOCKED)
+
+    def test_leetcode_api_429_is_rate_limited(self):
+        result = self.check(
+            self.response(403, text=self.cloudflare_page()),
+            self.response(429),
+        )
+
+        self.assertEqual(result[1], RATE_LIMIT)
+
+    def test_leetcode_api_5xx_is_error(self):
+        result = self.check(
+            self.response(403, text=self.cloudflare_page()),
+            self.response(503),
+        )
+
+        self.assertEqual(result[1], ERROR)
+
+    def test_leetcode_network_failure_is_error(self):
+        web = self.response(403, text=self.cloudflare_page())
+        with (
+            patch(
+                "main.username.requests.request",
+                side_effect=[
+                    web,
+                    requests.ConnectionError("network unavailable"),
+                ],
+            ),
+            patch("main.username.time.sleep"),
+        ):
+            result = check_username_on_site(
+                self.username,
+                self.site_name,
+                self.site_config,
+            )
+
+        self.assertEqual(result[1], ERROR)
+
+    def test_leetcode_timeout_is_error(self):
+        web = self.response(403, text=self.cloudflare_page())
+        with (
+            patch(
+                "main.username.requests.request",
+                side_effect=[web, requests.Timeout("request timed out")],
+            ),
+            patch("main.username.time.sleep"),
+        ):
+            result = check_username_on_site(
+                self.username,
+                self.site_name,
+                self.site_config,
+            )
+
+        self.assertEqual(result[1], ERROR)
+
+    def test_leetcode_graphql_request_uses_public_operation(self):
+        web = self.response(403, text=self.cloudflare_page())
+        api = self.response(
+            200,
+            url="https://leetcode.com/graphql/",
+            json_data=self.profile_data(),
+        )
+        with (
+            patch(
+                "main.username.requests.request",
+                side_effect=[web, api],
+            ) as request_mock,
+            patch("main.username.time.sleep"),
+        ):
+            result = check_username_on_site(
+                self.username,
+                self.site_name,
+                self.site_config,
+            )
+
+        self.assertEqual(result[1], FOUND)
+        api_call = request_mock.call_args_list[1]
+        self.assertEqual(api_call.kwargs["method"], "POST")
+        self.assertEqual(
+            api_call.kwargs["url"],
+            "https://leetcode.com/graphql/",
+        )
+        self.assertEqual(
+            api_call.kwargs["json"]["operationName"],
+            "userPublicProfile",
+        )
+        self.assertEqual(
+            api_call.kwargs["json"]["variables"],
+            {"username": self.username},
+        )
+
+    def test_leetcode_config_uses_current_endpoint_and_checker(self):
+        config = load_sites_config()["LeetCode"]
+
+        self.assertEqual(
+            config["url"],
+            "https://leetcode.com/u/{username}/",
+        )
+        self.assertEqual(config["checker"], "leetcode_profile")
+
+
 class EighthPublicProfileNetworkErrorTests(unittest.TestCase):
     def test_network_errors_are_error_for_all_five_checkers(self):
         configs = {

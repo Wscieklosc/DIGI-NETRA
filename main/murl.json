@@ -284,7 +284,8 @@
     "confidence_score": 0.85
   },
   "LeetCode": {
-    "url": "https://leetcode.com/{username}/",
+    "url": "https://leetcode.com/u/{username}/",
+    "checker": "leetcode_profile",
     "detect_based_on_message": true,
     "not_found_status_codes": [404],
     "not_found_message": "404 Not Found",

@@ -9589,6 +9589,258 @@ def classify_fivehundredpx_profile_response(
 
 
 # ============================================================
+# SPECJALNA DETEKCJA PROFILI LEETCODE
+# ============================================================
+
+def _leetcode_profile_url_matches(value, username):
+    if not isinstance(value, str) or not value:
+        return False
+
+    parsed = urlparse(value)
+    expected_path = f"/u/{unquote(str(username)).casefold()}/"
+
+    return (
+        parsed.scheme == "https"
+        and parsed.netloc.casefold() == "leetcode.com"
+        and unquote(parsed.path).casefold() == expected_path
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
+def _leetcode_normalized_username(value):
+    if not isinstance(value, str):
+        return None
+    return unquote(value).casefold()
+
+
+def _leetcode_graphql_url_matches(value):
+    if not isinstance(value, str) or not value:
+        return False
+
+    parsed = urlparse(value)
+    return (
+        parsed.scheme == "https"
+        and parsed.netloc.casefold() == "leetcode.com"
+        and parsed.path == "/graphql/"
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
+def _leetcode_graphql_json(response):
+    try:
+        value = response.json()
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _leetcode_is_cloudflare_challenge(response):
+    content = response.text if isinstance(response.text, str) else ""
+    soup = BeautifulSoup(content, "html.parser")
+    title = soup.title.get_text(" ", strip=True).casefold() if soup.title else ""
+    lowered = content.casefold()
+
+    return bool(
+        "cf-chl-" in lowered
+        or soup.select_one("form#challenge-form")
+        or title == "just a moment..."
+    )
+
+
+def _leetcode_web_preflight_result(response):
+    transport_result = _public_profile_transport_result(
+        response,
+        "LeetCode",
+    )
+    expected_cloudflare_challenge = bool(
+        response.status_code == 403
+        and _leetcode_is_cloudflare_challenge(response)
+    )
+    if transport_result and not expected_cloudflare_challenge:
+        return transport_result
+
+    if (
+        response.status_code == 200
+        and _leetcode_is_cloudflare_challenge(response)
+    ):
+        return BLOCKED, None, "LeetCode challenge page"
+
+    return None
+
+
+def _leetcode_not_found_error_matches(errors):
+    if not isinstance(errors, list) or len(errors) != 1:
+        return False
+
+    error = errors[0]
+    if not isinstance(error, dict):
+        return False
+
+    return bool(
+        error.get("message") == "That user does not exist."
+        and error.get("path") == ["matchedUser"]
+    )
+
+
+def classify_leetcode_profile_response(
+    username,
+    response,
+    api_response,
+    profile_url,
+):
+    web_preflight_result = _leetcode_web_preflight_result(response)
+    if web_preflight_result:
+        return web_preflight_result
+
+    api_transport_result = _public_profile_transport_result(
+        api_response,
+        "LeetCode public GraphQL",
+    )
+    if api_transport_result:
+        return api_transport_result
+
+    if _leetcode_is_cloudflare_challenge(api_response):
+        return BLOCKED, None, "LeetCode GraphQL challenge page"
+
+    final_matches = _leetcode_profile_url_matches(response.url, username)
+    if response.url and not final_matches:
+        return UNKNOWN, None, "LeetCode final URL conflict"
+
+    if api_response.url and not _leetcode_graphql_url_matches(api_response.url):
+        return UNKNOWN, None, "LeetCode GraphQL URL conflict"
+
+    payload = _leetcode_graphql_json(api_response)
+    if payload is None:
+        return UNKNOWN, None, "invalid LeetCode GraphQL response"
+
+    if api_response.status_code != 200:
+        return UNKNOWN, None, "unexpected LeetCode GraphQL response"
+
+    if response.status_code not in (200, 403):
+        return UNKNOWN, None, "unexpected LeetCode profile response"
+
+    if set(payload) - {"data", "errors"}:
+        return UNKNOWN, None, "LeetCode GraphQL structure conflict"
+
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return UNKNOWN, None, "invalid LeetCode GraphQL structure"
+
+    if set(data) - {"matchedUser"}:
+        return UNKNOWN, None, "LeetCode GraphQL data conflict"
+
+    if "matchedUser" not in data:
+        if payload.get("errors") in (None, []):
+            return POSSIBLE, profile_url, "incomplete LeetCode profile evidence"
+        return UNKNOWN, None, "LeetCode GraphQL errors conflict"
+
+    public_user = data.get("matchedUser")
+    errors = payload.get("errors")
+
+    if public_user is None:
+        if (
+            set(payload) == {"data", "errors"}
+            and _leetcode_not_found_error_matches(errors)
+            and final_matches
+        ):
+            return NOT_FOUND, None, "public LeetCode profile not found"
+        return UNKNOWN, None, "unconfirmed LeetCode missing profile"
+
+    if not isinstance(public_user, dict):
+        return UNKNOWN, None, "invalid LeetCode user data"
+
+    if errors not in (None, []):
+        return UNKNOWN, None, "LeetCode GraphQL errors conflict"
+
+    allowed_user_fields = {"__typename", "username", "profile"}
+    if not set(public_user).issubset(allowed_user_fields):
+        return UNKNOWN, None, "LeetCode user structure conflict"
+
+    public_type = public_user.get("__typename")
+    public_username = public_user.get("username")
+    profile = public_user.get("profile")
+    expected_username = _leetcode_normalized_username(username)
+
+    conflicts = (
+        bool(
+            public_type is not None
+            and (
+                not isinstance(public_type, str)
+                or public_type != "UserNode"
+            )
+        ),
+        bool(
+            public_username is not None
+            and (
+                not isinstance(public_username, str)
+                or _leetcode_normalized_username(public_username)
+                != expected_username
+            )
+        ),
+        bool(profile is not None and not isinstance(profile, dict)),
+    )
+    if any(conflicts):
+        return UNKNOWN, None, "LeetCode profile evidence conflict"
+
+    if not isinstance(profile, dict):
+        return POSSIBLE, profile_url, "incomplete LeetCode profile evidence"
+
+    allowed_profile_fields = {
+        "realName",
+        "userAvatar",
+        "ranking",
+        "reputation",
+    }
+    if not set(profile).issubset(allowed_profile_fields):
+        return UNKNOWN, None, "LeetCode profile structure conflict"
+
+    real_name = profile.get("realName")
+    avatar = profile.get("userAvatar")
+    ranking = profile.get("ranking")
+    reputation = profile.get("reputation")
+
+    profile_conflicts = (
+        bool(real_name is not None and not isinstance(real_name, str)),
+        bool(avatar is not None and not isinstance(avatar, str)),
+        bool(
+            ranking is not None
+            and (
+                not isinstance(ranking, int)
+                or isinstance(ranking, bool)
+            )
+        ),
+        bool(
+            reputation is not None
+            and (
+                not isinstance(reputation, int)
+                or isinstance(reputation, bool)
+            )
+        ),
+    )
+    if any(profile_conflicts):
+        return UNKNOWN, None, "LeetCode profile evidence conflict"
+
+    complete_profile = bool(
+        set(public_user) == allowed_user_fields
+        and public_type == "UserNode"
+        and isinstance(public_username, str)
+        and _leetcode_normalized_username(public_username)
+        == expected_username
+    )
+
+    if final_matches and complete_profile:
+        return (
+            FOUND,
+            profile_url,
+            "public LeetCode profile found; identity not verified",
+        )
+
+    return POSSIBLE, profile_url, "incomplete LeetCode profile evidence"
+
+
+# ============================================================
 # SPRAWDZANIE JEDNEGO SERWISU
 # ============================================================
 
@@ -10348,6 +10600,45 @@ def check_username_on_site(username, site_name, site_config):
                 allow_redirects=True,
             )
             status, link, info = classify_fivehundredpx_profile_response(
+                username,
+                response,
+                api_response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "leetcode_profile":
+            web_preflight_result = _leetcode_web_preflight_result(response)
+            if web_preflight_result:
+                status, link, info = web_preflight_result
+                return site_name, status, link, info
+
+            graphql_headers = {
+                **headers,
+                "Content-Type": "application/json",
+                "Referer": "https://leetcode.com/",
+            }
+            graphql_payload = {
+                "operationName": "userPublicProfile",
+                "variables": {"username": username},
+                "query": (
+                    "query userPublicProfile($username: String!) { "
+                    "matchedUser(username: $username) { "
+                    "__typename username profile { "
+                    "realName userAvatar ranking reputation "
+                    "} } }"
+                ),
+            }
+            api_response = requests.request(
+                method="POST",
+                url="https://leetcode.com/graphql/",
+                headers=graphql_headers,
+                json=graphql_payload,
+                timeout=timeout,
+                allow_redirects=True,
+            )
+            status, link, info = classify_leetcode_profile_response(
                 username,
                 response,
                 api_response,
