@@ -2,6 +2,7 @@ import json
 import re
 import time
 import requests
+import xml.etree.ElementTree as ET
 
 from bs4 import BeautifulSoup
 from rich import print
@@ -9841,6 +9842,222 @@ def classify_leetcode_profile_response(
 
 
 # ============================================================
+# SPECJALNA DETEKCJA PROFILI STEAM
+# ============================================================
+
+def _steam_normalized_username(value):
+    if not isinstance(value, str):
+        return None
+    return unquote(value).casefold()
+
+
+def _steam_profile_url_matches(value, username):
+    if not isinstance(value, str) or not value:
+        return False
+
+    parsed = urlparse(value)
+    expected_path = f"/id/{_steam_normalized_username(str(username))}/"
+
+    return (
+        parsed.scheme == "https"
+        and parsed.netloc.casefold() == "steamcommunity.com"
+        and unquote(parsed.path).casefold() == expected_path
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
+def _steam_xml_url_matches(value, username):
+    if not isinstance(value, str) or not value:
+        return False
+
+    parsed = urlparse(value)
+    expected_path = f"/id/{_steam_normalized_username(str(username))}/"
+
+    return (
+        parsed.scheme == "https"
+        and parsed.netloc.casefold() == "steamcommunity.com"
+        and unquote(parsed.path).casefold() == expected_path
+        and parsed.query == "xml=1"
+        and not parsed.fragment
+    )
+
+
+def _steam_is_block_page(response):
+    content = response.text if isinstance(response.text, str) else ""
+    stripped_content = content.lstrip()
+    if stripped_content.startswith(("<?xml", "<profile", "<response")):
+        return False
+
+    soup = BeautifulSoup(content, "html.parser")
+    title = soup.title.get_text(" ", strip=True).casefold() if soup.title else ""
+
+    return bool(
+        soup.select_one(
+            "form#challenge-form, .g-recaptcha, [data-sitekey]"
+        )
+        or title in {
+            "just a moment...",
+            "access denied",
+            "captcha",
+        }
+    )
+
+
+def _steam_xml_root(response):
+    try:
+        return ET.fromstring(response.text)
+    except (ET.ParseError, TypeError, ValueError):
+        return None
+
+
+def _steam_direct_nodes(root):
+    nodes = {}
+    for child in list(root):
+        nodes.setdefault(child.tag, []).append((child.text or "").strip())
+    return nodes
+
+
+def classify_steam_profile_response(
+    username,
+    response,
+    xml_response,
+    profile_url,
+):
+    for public_response, service_name in (
+        (response, "Steam"),
+        (xml_response, "Steam public XML"),
+    ):
+        transport_result = _public_profile_transport_result(
+            public_response,
+            service_name,
+        )
+        if transport_result:
+            return transport_result
+
+        if _steam_is_block_page(public_response):
+            return BLOCKED, None, f"{service_name} challenge page"
+
+    final_matches = _steam_profile_url_matches(response.url, username)
+    xml_url_matches = _steam_xml_url_matches(xml_response.url, username)
+
+    if response.url and not final_matches:
+        return UNKNOWN, None, "Steam final URL conflict"
+
+    if xml_response.url and not xml_url_matches:
+        return UNKNOWN, None, "Steam XML URL conflict"
+
+    if response.status_code != 200 or xml_response.status_code != 200:
+        return UNKNOWN, None, "unexpected Steam response"
+
+    root = _steam_xml_root(xml_response)
+    if root is None:
+        return UNKNOWN, None, "invalid Steam XML response"
+
+    nodes = _steam_direct_nodes(root)
+    critical_tags = {
+        "error",
+        "steamID64",
+        "customURL",
+        "privacyState",
+        "visibilityState",
+    }
+    if any(len(nodes.get(tag, [])) > 1 for tag in critical_tags):
+        return UNKNOWN, None, "Steam XML structure conflict"
+
+    profile_markers = {
+        "steamID64",
+        "steamID",
+        "customURL",
+        "privacyState",
+        "visibilityState",
+        "avatarIcon",
+        "avatarMedium",
+        "avatarFull",
+    }
+
+    if root.tag == "response":
+        if (
+            final_matches
+            and xml_url_matches
+            and set(nodes) == {"error"}
+            and nodes.get("error")
+            == ["The specified profile could not be found."]
+            and not profile_markers.intersection(nodes)
+        ):
+            return (
+                NOT_FOUND,
+                None,
+                "public Steam vanity profile not found",
+            )
+        return UNKNOWN, None, "unconfirmed Steam missing profile"
+
+    if root.tag != "profile":
+        return UNKNOWN, None, "unexpected Steam XML root"
+
+    if "error" in nodes:
+        return UNKNOWN, None, "Steam profile and error conflict"
+
+    public_id = nodes.get("steamID64", [None])[0]
+    custom_url = nodes.get("customURL", [None])[0]
+    privacy_state = nodes.get("privacyState", [None])[0]
+    visibility_state = nodes.get("visibilityState", [None])[0]
+    expected_username = _steam_normalized_username(username)
+
+    if custom_url is not None and (
+        not custom_url
+        or _steam_normalized_username(custom_url) != expected_username
+    ):
+        return UNKNOWN, None, "Steam custom URL conflict"
+
+    if public_id is not None and not re.fullmatch(r"[0-9]{17}", public_id):
+        return UNKNOWN, None, "Steam ID conflict"
+
+    if visibility_state is not None and (
+        not visibility_state
+        or not visibility_state.isdigit()
+    ):
+        return UNKNOWN, None, "Steam visibility conflict"
+
+    if (
+        privacy_state == "public"
+        and visibility_state is not None
+        and visibility_state != "3"
+    ):
+        return UNKNOWN, None, "Steam privacy and visibility conflict"
+
+    if (
+        privacy_state == "private"
+        and visibility_state is not None
+        and visibility_state != "1"
+    ):
+        return UNKNOWN, None, "Steam privacy and visibility conflict"
+
+    if public_id is None and custom_url is None:
+        return UNKNOWN, None, "Steam profile without identifying evidence"
+
+    complete_public_profile = bool(
+        final_matches
+        and xml_url_matches
+        and custom_url
+        and _steam_normalized_username(custom_url) == expected_username
+        and public_id
+        and re.fullmatch(r"[0-9]{17}", public_id)
+        and privacy_state == "public"
+        and visibility_state == "3"
+    )
+
+    if complete_public_profile:
+        return (
+            FOUND,
+            profile_url,
+            "public Steam vanity profile found; identity not verified",
+        )
+
+    return POSSIBLE, profile_url, "incomplete Steam vanity profile evidence"
+
+
+# ============================================================
 # SPRAWDZANIE JEDNEGO SERWISU
 # ============================================================
 
@@ -10642,6 +10859,39 @@ def check_username_on_site(username, site_name, site_config):
                 username,
                 response,
                 api_response,
+                url,
+            )
+
+            return site_name, status, link, info
+
+        if checker == "steam_profile":
+            web_transport_result = _public_profile_transport_result(
+                response,
+                "Steam",
+            )
+            if web_transport_result:
+                status, link, info = web_transport_result
+                return site_name, status, link, info
+
+            if _steam_is_block_page(response):
+                return site_name, BLOCKED, None, "Steam challenge page"
+
+            encoded_username = quote(username, safe="")
+            xml_url = (
+                "https://steamcommunity.com/id/"
+                f"{encoded_username}/?xml=1"
+            )
+            xml_response = requests.request(
+                method="GET",
+                url=xml_url,
+                headers=headers,
+                timeout=timeout,
+                allow_redirects=True,
+            )
+            status, link, info = classify_steam_profile_response(
+                username,
+                response,
+                xml_response,
                 url,
             )
 

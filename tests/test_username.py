@@ -7694,6 +7694,466 @@ class LeetCodeProfileDetectionTests(unittest.TestCase):
         self.assertEqual(config["checker"], "leetcode_profile")
 
 
+class SteamProfileDetectionTests(unittest.TestCase):
+    username = "Test_User"
+    site_name = "Steam"
+    site_config = {
+        "url": "https://steamcommunity.com/id/{username}/",
+        "checker": "steam_profile",
+        "rate_limit_delay": 0,
+    }
+
+    def response(self, status_code, text="", url=None):
+        response = Mock()
+        response.status_code = status_code
+        response.text = text
+        response.url = (
+            url
+            if url is not None
+            else "https://steamcommunity.com/id/Test_User/"
+        )
+        return response
+
+    def profile_xml(self, **overrides):
+        values = {
+            "steamID64": "76561198000000001",
+            "steamID": "Test User",
+            "privacyState": "public",
+            "visibilityState": "3",
+            "customURL": "TEST_user",
+            "avatarFull": "https://avatars.cloudflare.steamstatic.com/test.jpg",
+        }
+        values.update(overrides)
+        fields = "".join(
+            f"<{name}>{value}</{name}>"
+            for name, value in values.items()
+            if value is not None
+        )
+        return f"<profile>{fields}</profile>"
+
+    def not_found_xml(self, extra=""):
+        return (
+            "<response>"
+            "<error>The specified profile could not be found.</error>"
+            f"{extra}"
+            "</response>"
+        )
+
+    def challenge_page(self):
+        return (
+            "<html><head><title>Just a moment...</title></head>"
+            "<body><form id='challenge-form'></form></body></html>"
+        )
+
+    def check(self, web_response, xml_response=None):
+        responses = [web_response]
+        if xml_response is not None:
+            if xml_response.url == (
+                "https://steamcommunity.com/id/Test_User/"
+            ):
+                xml_response.url = (
+                    "https://steamcommunity.com/id/Test_User/?xml=1"
+                )
+            responses.append(xml_response)
+
+        with (
+            patch("main.username.requests.request", side_effect=responses),
+            patch("main.username.time.sleep"),
+        ):
+            return check_username_on_site(
+                self.username,
+                self.site_name,
+                self.site_config,
+            )
+
+    def test_steam_certain_public_profile_is_found(self):
+        result = self.check(
+            self.response(200),
+            self.response(200, text=self.profile_xml()),
+        )
+
+        self.assertEqual(result[1], FOUND)
+        self.assertEqual(
+            result[3],
+            "public Steam vanity profile found; identity not verified",
+        )
+
+    def test_steam_confirmed_missing_vanity_profile_is_not_found(self):
+        result = self.check(
+            self.response(200),
+            self.response(200, text=self.not_found_xml()),
+        )
+
+        self.assertEqual(result[1], NOT_FOUND)
+
+    def test_steam_page_200_without_valid_xml_is_not_found_never_found(self):
+        result = self.check(
+            self.response(200),
+            self.response(200, text="<html>generic shell</html>"),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+        self.assertNotEqual(result[1], FOUND)
+
+    def test_steam_private_profile_is_possible(self):
+        result = self.check(
+            self.response(200),
+            self.response(
+                200,
+                text=self.profile_xml(
+                    customURL=None,
+                    privacyState="private",
+                    visibilityState="1",
+                ),
+            ),
+        )
+
+        self.assertEqual(result[1], POSSIBLE)
+
+    def test_steam_username_conflict_is_unknown(self):
+        result = self.check(
+            self.response(200),
+            self.response(
+                200,
+                text=self.profile_xml(customURL="Other_User"),
+            ),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_steam_page_final_url_conflict_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                url="https://steamcommunity.com/id/Other_User/",
+            ),
+            self.response(200, text=self.profile_xml()),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_steam_xml_final_url_conflict_is_unknown(self):
+        result = self.check(
+            self.response(200),
+            self.response(
+                200,
+                text=self.profile_xml(),
+                url="https://steamcommunity.com/id/Other_User/?xml=1",
+            ),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_steam_http_page_url_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                url="http://steamcommunity.com/id/Test_User/",
+            ),
+            self.response(200, text=self.profile_xml()),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_steam_query_in_page_url_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                url="https://steamcommunity.com/id/Test_User/?source=test",
+            ),
+            self.response(200, text=self.profile_xml()),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_steam_fragment_in_page_url_is_unknown(self):
+        result = self.check(
+            self.response(
+                200,
+                url="https://steamcommunity.com/id/Test_User/#profile",
+            ),
+            self.response(200, text=self.profile_xml()),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_steam_extra_xml_query_is_unknown(self):
+        result = self.check(
+            self.response(200),
+            self.response(
+                200,
+                text=self.profile_xml(),
+                url=(
+                    "https://steamcommunity.com/id/Test_User/"
+                    "?xml=1&source=test"
+                ),
+            ),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_steam_non_numeric_stable_id_is_unknown(self):
+        result = self.check(
+            self.response(200),
+            self.response(
+                200,
+                text=self.profile_xml(steamID64="not-a-number"),
+            ),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_steam_short_numeric_stable_id_is_unknown(self):
+        result = self.check(
+            self.response(200),
+            self.response(
+                200,
+                text=self.profile_xml(steamID64="123"),
+            ),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_steam_empty_stable_id_is_unknown(self):
+        result = self.check(
+            self.response(200),
+            self.response(
+                200,
+                text=self.profile_xml(steamID64=""),
+            ),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_steam_unicode_digits_stable_id_is_unknown(self):
+        result = self.check(
+            self.response(200),
+            self.response(
+                200,
+                text=self.profile_xml(steamID64="٧٦٥٦١١٩٨٠٠٠٠٠٠٠٠١"),
+            ),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_steam_missing_stable_id_is_possible(self):
+        result = self.check(
+            self.response(200),
+            self.response(
+                200,
+                text=self.profile_xml(steamID64=None),
+            ),
+        )
+
+        self.assertEqual(result[1], POSSIBLE)
+
+    def test_steam_empty_profile_is_unknown(self):
+        result = self.check(
+            self.response(200),
+            self.response(200, text="<profile/>")
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_steam_duplicate_stable_id_is_unknown(self):
+        xml = self.profile_xml().replace(
+            "</profile>",
+            "<steamID64>76561198000000002</steamID64></profile>",
+        )
+        result = self.check(
+            self.response(200),
+            self.response(200, text=xml),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_steam_profile_and_error_conflict_is_unknown(self):
+        xml = self.profile_xml().replace(
+            "</profile>",
+            "<error>The specified profile could not be found.</error>"
+            "</profile>",
+        )
+        result = self.check(
+            self.response(200),
+            self.response(200, text=xml),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_steam_not_found_with_profile_data_is_unknown(self):
+        result = self.check(
+            self.response(200),
+            self.response(
+                200,
+                text=self.not_found_xml(
+                    "<steamID64>76561198000000001</steamID64>"
+                ),
+            ),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_steam_unexpected_not_found_message_is_unknown(self):
+        result = self.check(
+            self.response(200),
+            self.response(
+                200,
+                text="<response><error>Temporary failure</error></response>",
+            ),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_steam_malformed_xml_is_unknown(self):
+        result = self.check(
+            self.response(200),
+            self.response(200, text="<profile><steamID64>123"),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_steam_unexpected_xml_root_is_unknown(self):
+        result = self.check(
+            self.response(200),
+            self.response(200, text="<html><body>shell</body></html>"),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_steam_privacy_visibility_conflict_is_unknown(self):
+        result = self.check(
+            self.response(200),
+            self.response(
+                200,
+                text=self.profile_xml(
+                    privacyState="public",
+                    visibilityState="1",
+                ),
+            ),
+        )
+
+        self.assertEqual(result[1], UNKNOWN)
+
+    def test_steam_bundle_not_found_text_does_not_override_xml_profile(self):
+        result = self.check(
+            self.response(
+                200,
+                text="<script>The specified profile could not be found.</script>",
+            ),
+            self.response(200, text=self.profile_xml()),
+        )
+
+        self.assertEqual(result[1], FOUND)
+
+    def test_steam_page_403_is_blocked(self):
+        self.assertEqual(self.check(self.response(403))[1], BLOCKED)
+
+    def test_steam_page_challenge_is_blocked(self):
+        self.assertEqual(
+            self.check(self.response(200, text=self.challenge_page()))[1],
+            BLOCKED,
+        )
+
+    def test_steam_xml_403_is_blocked(self):
+        result = self.check(
+            self.response(200),
+            self.response(403),
+        )
+
+        self.assertEqual(result[1], BLOCKED)
+
+    def test_steam_xml_429_is_rate_limited(self):
+        result = self.check(
+            self.response(200),
+            self.response(429),
+        )
+
+        self.assertEqual(result[1], RATE_LIMIT)
+
+    def test_steam_xml_5xx_is_error(self):
+        result = self.check(
+            self.response(200),
+            self.response(503),
+        )
+
+        self.assertEqual(result[1], ERROR)
+
+    def test_steam_network_failure_is_error(self):
+        with (
+            patch(
+                "main.username.requests.request",
+                side_effect=[
+                    self.response(200),
+                    requests.ConnectionError("network unavailable"),
+                ],
+            ),
+            patch("main.username.time.sleep"),
+        ):
+            result = check_username_on_site(
+                self.username,
+                self.site_name,
+                self.site_config,
+            )
+
+        self.assertEqual(result[1], ERROR)
+
+    def test_steam_timeout_is_error(self):
+        with (
+            patch(
+                "main.username.requests.request",
+                side_effect=[
+                    self.response(200),
+                    requests.Timeout("request timed out"),
+                ],
+            ),
+            patch("main.username.time.sleep"),
+        ):
+            result = check_username_on_site(
+                self.username,
+                self.site_name,
+                self.site_config,
+            )
+
+        self.assertEqual(result[1], ERROR)
+
+    def test_steam_request_uses_public_xml_endpoint(self):
+        web = self.response(200)
+        xml = self.response(
+            200,
+            text=self.profile_xml(),
+            url="https://steamcommunity.com/id/Test_User/?xml=1",
+        )
+        with (
+            patch(
+                "main.username.requests.request",
+                side_effect=[web, xml],
+            ) as request_mock,
+            patch("main.username.time.sleep"),
+        ):
+            result = check_username_on_site(
+                self.username,
+                self.site_name,
+                self.site_config,
+            )
+
+        self.assertEqual(result[1], FOUND)
+        xml_call = request_mock.call_args_list[1]
+        self.assertEqual(xml_call.kwargs["method"], "GET")
+        self.assertEqual(
+            xml_call.kwargs["url"],
+            "https://steamcommunity.com/id/Test_User/?xml=1",
+        )
+
+    def test_steam_config_uses_strict_checker_and_canonical_path(self):
+        config = load_sites_config()["Steam"]
+
+        self.assertEqual(
+            config["url"],
+            "https://steamcommunity.com/id/{username}/",
+        )
+        self.assertEqual(config["checker"], "steam_profile")
+
+
 class EighthPublicProfileNetworkErrorTests(unittest.TestCase):
     def test_network_errors_are_error_for_all_five_checkers(self):
         configs = {

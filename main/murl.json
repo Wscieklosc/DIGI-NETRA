@@ -407,11 +407,8 @@
     "confidence_score": 0.8
   },
   "Steam": {
-    "url": "https://steamcommunity.com/id/{username}",
-    "detect_based_on_message": true,
-    "not_found_status_codes": [404],
-    "not_found_message": "The specified profile could not be found.",
-    "found_message": "",
+    "url": "https://steamcommunity.com/id/{username}/",
+    "checker": "steam_profile",
     "request_method": "GET",
     "headers": {
       "User-Agent": "Mozilla/5.0"
